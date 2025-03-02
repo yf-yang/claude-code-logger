@@ -2,6 +2,21 @@
 
 A simple tool to log API calls made by the Claude CLI to Anthropic's API.
 
+## Disclaimer
+
+**FOR RESEARCH PURPOSES ONLY**
+
+This tool is provided strictly for research and educational purposes only. By using this software, you agree to the following:
+
+1. The author makes no warranties or representations of any kind concerning this software and accepts no liability for its use.
+2. The author assumes no responsibility whatsoever for any consequences arising from the use of this tool.
+3. Users are solely responsible for ensuring their use of this tool complies with all applicable laws, regulations, and Anthropic's terms of service.
+4. This tool is not officially affiliated with, authorized, maintained, sponsored, or endorsed by Anthropic or any of its affiliates.
+
+Use at your own risk.
+
+This project was developed with [Claude Code](https://claude.ai/code).
+
 ## Installation
 
 ### Global Installation (recommended)
