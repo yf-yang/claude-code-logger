@@ -1,0 +1,21 @@
+{
+  "name": "claude-logger",
+  "version": "1.0.0",
+  "description": "Log Anthropic API calls made through the Claude CLI",
+  "main": "claude_logger.js",
+  "bin": {
+    "claude-log": "./bin/claude-log"
+  },
+  "scripts": {
+    "start": "node claude_logger.js"
+  },
+  "keywords": [
+    "claude",
+    "api",
+    "logger",
+    "anthropic"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {}
+}
