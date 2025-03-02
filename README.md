@@ -1,6 +1,6 @@
-# Claude API Logger
+# Claude Code API Logger
 
-A simple tool to log API calls made by the Claude CLI to Anthropic's API.
+A simple tool to log API calls made by the Claude Code CLI to Anthropic's API.
 
 ## Disclaimer
 
@@ -15,7 +15,7 @@ This tool is provided strictly for research and educational purposes only. By us
 
 Use at your own risk.
 
-This project was developed with [Claude Code](https://claude.ai/code).
+This project itself was developed with [Claude Code](https://claude.ai/code).
 
 ## Installation
 
@@ -54,7 +54,7 @@ All arguments after the options are passed directly to the Claude CLI.
 claude-log
 
 # Run Claude with a prompt
-claude-log -p "What is the capital of France?"
+claude-log -p "What is Rust and why do people care?"
 
 # Save both requests and responses
 claude-log --save-responses
