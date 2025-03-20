@@ -8,29 +8,33 @@
  */
 
 const fs = require("fs");
-const path = require("path");
 const http = require("http");
 const https = require("https");
+const zlib = require("zlib");
 
 // Configuration from environment variables
-const os = require("os");
-const logDir = process.env.CLAUDE_API_LOG_DIR || path.join(os.homedir(), ".claude_logs");
-const timestamp = process.env.CLAUDE_API_LOG_NAME || new Date().toISOString().replace(/:/g, "-");
-const logFile = path.join(logDir, `requests_${timestamp}.json`);
-const responseLogFile = path.join(logDir, `responses_${timestamp}.json`);
+const logFile = process.env.CLAUDE_API_LOG_FILE;
 const debugMode = process.env.CLAUDE_DEBUG === "true";
 const logResponses = process.env.CLAUDE_LOG_RESPONSES !== "false";
 
-// In-memory storage for logs
-const requestLogs = [];
-const responseLogs = [];
+// In-memory store for accumulating logs
+const apiLogs = [];
 
 // Sensitive data patterns to redact
 const sensitivePatterns = [
-  { regex: /"x-api-key":\s*"([^"]+)"/g, replacement: '"x-api-key": "[REDACTED]"' },
-  { regex: /"Authorization":\s*"([^"]+)"/gi, replacement: '"Authorization": "[REDACTED]"' },
+  {
+    regex: /"x-api-key":\s*"([^"]+)"/g,
+    replacement: '"x-api-key": "[REDACTED]"',
+  },
+  {
+    regex: /"Authorization":\s*"([^"]+)"/gi,
+    replacement: '"Authorization": "[REDACTED]"',
+  },
   { regex: /"user_id":\s*"([^"]+)"/g, replacement: '"user_id": "[REDACTED]"' },
-  { regex: /"session_id":\s*"([^"]+)"/g, replacement: '"session_id": "[REDACTED]"' },
+  {
+    regex: /"session_id":\s*"([^"]+)"/g,
+    replacement: '"session_id": "[REDACTED]"',
+  },
 ];
 
 // Debug logging function that only logs when debug mode is enabled
@@ -112,30 +116,34 @@ function logRequest(protocol, options, req, url) {
 
   debugLog(`Found Claude API request to: ${url}`);
 
-  // Create log data object
-  const logData = {
-    timestamp: new Date().toISOString(),
-    protocol: protocol,
-    url: url,
+  // Create log data object with request/response structure
+  const logEntry = {
+    request: {
+      timestamp: new Date().toISOString(),
+      protocol: protocol,
+      url: url,
+    },
+    response: null, // Will be populated when response is received
   };
+  apiLogs.push(logEntry);
 
   // Add method and headers if available (with sensitive data redacted)
   if (typeof options === "object") {
-    logData.method = options.method || "GET";
+    logEntry.request.method = options.method || "GET";
 
     // Deep copy and redact headers
     if (options.headers) {
-      logData.headers = JSON.parse(JSON.stringify(options.headers));
+      logEntry.request.headers = JSON.parse(JSON.stringify(options.headers));
 
       // Explicitly redact sensitive headers
-      if (logData.headers["x-api-key"]) {
-        logData.headers["x-api-key"] = "[REDACTED]";
+      if (logEntry.request.headers["x-api-key"]) {
+        logEntry.request.headers["x-api-key"] = "[REDACTED]";
       }
-      if (logData.headers["authorization"]) {
-        logData.headers["authorization"] = "[REDACTED]";
+      if (logEntry.request.headers["authorization"]) {
+        logEntry.request.headers["authorization"] = "[REDACTED]";
       }
     } else {
-      logData.headers = {};
+      logEntry.request.headers = {};
     }
   }
 
@@ -165,18 +173,15 @@ function logRequest(protocol, options, req, url) {
             bodyObj.user_id = "[REDACTED]";
           }
 
-          logData.body = bodyObj;
+          logEntry.request.body = bodyObj;
         } catch (e) {
           // If not valid JSON, store as string with redacted sensitive info
-          logData.body = redactSensitiveInfo(body);
+          logEntry.request.body = redactSensitiveInfo(body);
         }
       } catch (e) {
-        logData.body = "Error capturing body: " + e.message;
+        logEntry.request.body = "Error capturing body: " + e.message;
       }
     }
-
-    // Store request log in memory
-    requestLogs.push(logData);
 
     // Call original method
     return originalEnd.apply(this, arguments);
@@ -187,20 +192,43 @@ function logRequest(protocol, options, req, url) {
     req.on("response", (res) => {
       const responseData = {
         timestamp: new Date().toISOString(),
-        requestUrl: url,
         statusCode: res.statusCode,
         headers: res.headers,
       };
 
       // Collect response body chunks
-      let responseBody = "";
+      const responseChunks = [];
       res.on("data", (chunk) => {
-        responseBody += chunk;
+        responseChunks.push(
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        );
       });
 
       // Process complete response
       res.on("end", () => {
-        if (res.headers["content-type"] && res.headers["content-type"].includes("text/event-stream")) {
+        let responseBody = "";
+        try {
+          const buffer = Buffer.concat(responseChunks);
+          if (res.headers["content-encoding"] === "gzip") {
+            responseBody = zlib.gunzipSync(buffer).toString();
+          } else if (res.headers["content-encoding"] === "br") {
+            responseBody = zlib.brotliDecompressSync(buffer).toString();
+          } else if (res.headers["content-encoding"] === "deflate") {
+            responseBody = zlib.inflateSync(buffer).toString();
+          } else {
+            responseBody = buffer.toString();
+          }
+        } catch (e) {
+          responseData.bodyError =
+            "Error processing response body: " + e.message;
+          logEntry.response = responseData;
+          return;
+        }
+
+        if (
+          res.headers["content-type"] &&
+          res.headers["content-type"].includes("text/event-stream")
+        ) {
           // Parse SSE responses
           try {
             responseData.events = responseBody
@@ -249,8 +277,7 @@ function logRequest(protocol, options, req, url) {
           }
         }
 
-        // Store in memory
-        responseLogs.push(responseData);
+        logEntry.response = responseData;
       });
     });
   }
@@ -258,30 +285,17 @@ function logRequest(protocol, options, req, url) {
 
 // Write logs function - can be called explicitly or on exit
 function writeLogsToFile() {
-  if (requestLogs.length === 0) {
+  if (apiLogs.length === 0) {
     debugLog("No Claude API requests were captured in this session.");
     return;
   }
 
-  debugLog("Writing captured Claude API logs to files...");
+  debugLog("Writing captured Claude API logs to file...");
 
   try {
-    // Make sure the log directory exists
-    if (!fs.existsSync(logDir)) {
-      fs.mkdirSync(logDir, { recursive: true });
-    }
-
-    // Write request logs
-    const requestContent = JSON.stringify(requestLogs, null, 2);
-    fs.writeFileSync(logFile, requestContent);
-    debugLog(`Requests saved to: ${logFile}`);
-
-    // Write response logs if we captured any and logging is enabled
-    if (logResponses && responseLogs.length > 0) {
-      const responseContent = JSON.stringify(responseLogs, null, 2);
-      fs.writeFileSync(responseLogFile, responseContent);
-      debugLog(`Responses saved to: ${responseLogFile}`);
-    }
+    const logsContent = JSON.stringify(apiLogs, null, 2);
+    fs.writeFileSync(logFile, logsContent);
+    debugLog(`API logs saved to: ${logFile}`);
   } catch (err) {
     console.error(`Error writing logs: ${err.message}`);
   }
@@ -289,12 +303,6 @@ function writeLogsToFile() {
 
 // Handle logs on exit
 process.on("exit", writeLogsToFile);
-
-// Create the log directory if it doesn't exist
-if (!fs.existsSync(logDir)) {
-  fs.mkdirSync(logDir, { recursive: true });
-  debugLog(`Created log directory: ${logDir}`);
-}
 
 // Try to write an empty array to make sure we can write to the files
 try {
@@ -311,33 +319,20 @@ if (require.main === module) {
   // Listen for termination signals
   process.on("SIGTERM", () => {
     debugLog("Capture process received SIGTERM, exiting");
-    writeLogsToFile(); // Write logs before exiting
-    process.exit(0);
+    writeLogsToFile();
+    process.exit(1);
   });
 
   process.on("SIGINT", () => {
     debugLog("Capture process received SIGINT, exiting");
-    writeLogsToFile(); // Write logs before exiting
-    process.exit(0);
+    writeLogsToFile();
+    process.exit(1);
   });
-
-  // Auto-exit after 30 minutes to prevent orphaned processes
-  setTimeout(
-    () => {
-      debugLog("Capture process timeout reached, exiting");
-      writeLogsToFile(); // Write logs before exiting
-      process.exit(0);
-    },
-    30 * 60 * 1000,
-  );
 }
 
 // Make this module available for use
 module.exports = {
-  requestLogs,
-  responseLogs,
+  apiLogs,
   writeLogsToFile,
-  logDir,
   logFile,
-  responseLogFile,
 };
