@@ -44,7 +44,6 @@ All arguments after the options are passed directly to the Claude CLI.
 ### Options
 
 - `--log_dir=DIR`: Directory to save logs (default: ~/.claude_logs)
-- `--save-responses`: Also save response data (default: off)
 - `--print`: Show debug messages (default: off)
 
 ### Examples
@@ -55,9 +54,6 @@ claude-log
 
 # Run Claude with a prompt
 claude-log -p "What is Rust and why do people care?"
-
-# Save both requests and responses
-claude-log --save-responses
 
 # Specify a custom log directory
 claude-log --log_dir=/path/to/logs

@@ -15,7 +15,6 @@ const zlib = require("zlib");
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
 const debugMode = process.env.CLAUDE_DEBUG === "true";
-const logResponses = process.env.CLAUDE_LOG_RESPONSES !== "false";
 
 // In-memory store for accumulating logs
 const apiLogs = [];
@@ -187,100 +186,95 @@ function logRequest(protocol, options, req, url) {
     return originalEnd.apply(this, arguments);
   };
 
-  // Capture response data if enabled
-  if (logResponses) {
-    req.on("response", (res) => {
-      const responseData = {
-        timestamp: new Date().toISOString(),
-        statusCode: res.statusCode,
-        headers: res.headers,
-      };
+  // Capture response data
+  req.on("response", (res) => {
+    const responseData = {
+      timestamp: new Date().toISOString(),
+      statusCode: res.statusCode,
+      headers: res.headers,
+    };
 
-      // Collect response body chunks
-      const responseChunks = [];
-      res.on("data", (chunk) => {
-        responseChunks.push(
-          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-        );
-      });
+    // Collect response body chunks
+    const responseChunks = [];
+    res.on("data", (chunk) => {
+      responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
 
-      // Process complete response
-      res.on("end", () => {
-        let responseBody = "";
-        try {
-          const buffer = Buffer.concat(responseChunks);
-          if (res.headers["content-encoding"] === "gzip") {
-            responseBody = zlib.gunzipSync(buffer).toString();
-          } else if (res.headers["content-encoding"] === "br") {
-            responseBody = zlib.brotliDecompressSync(buffer).toString();
-          } else if (res.headers["content-encoding"] === "deflate") {
-            responseBody = zlib.inflateSync(buffer).toString();
-          } else {
-            responseBody = buffer.toString();
-          }
-        } catch (e) {
-          responseData.bodyError =
-            "Error processing response body: " + e.message;
-          logEntry.response = responseData;
-          return;
+    // Process complete response
+    res.on("end", () => {
+      let responseBody = "";
+      try {
+        const buffer = Buffer.concat(responseChunks);
+        if (res.headers["content-encoding"] === "gzip") {
+          responseBody = zlib.gunzipSync(buffer).toString();
+        } else if (res.headers["content-encoding"] === "br") {
+          responseBody = zlib.brotliDecompressSync(buffer).toString();
+        } else if (res.headers["content-encoding"] === "deflate") {
+          responseBody = zlib.inflateSync(buffer).toString();
+        } else {
+          responseBody = buffer.toString();
         }
+      } catch (e) {
+        responseData.bodyError = "Error processing response body: " + e.message;
+        logEntry.response = responseData;
+        return;
+      }
 
-        if (
-          res.headers["content-type"] &&
-          res.headers["content-type"].includes("text/event-stream")
-        ) {
-          // Parse SSE responses
-          try {
-            responseData.events = responseBody
-              .split("\n\n")
-              .filter((event) => event.trim())
-              .map((event) => {
-                const lines = event.split("\n");
-                const result = {};
-                for (const line of lines) {
-                  if (line.startsWith("event: ")) {
-                    result.event = line.substring(7);
-                  } else if (line.startsWith("data: ")) {
-                    try {
-                      const data = JSON.parse(line.substring(6));
+      if (
+        res.headers["content-type"] &&
+        res.headers["content-type"].includes("text/event-stream")
+      ) {
+        // Parse SSE responses
+        try {
+          responseData.events = responseBody
+            .split("\n\n")
+            .filter((event) => event.trim())
+            .map((event) => {
+              const lines = event.split("\n");
+              const result = {};
+              for (const line of lines) {
+                if (line.startsWith("event: ")) {
+                  result.event = line.substring(7);
+                } else if (line.startsWith("data: ")) {
+                  try {
+                    const data = JSON.parse(line.substring(6));
 
-                      // Redact user_id in SSE events if present
-                      if (data.user_id) {
-                        data.user_id = "[REDACTED]";
-                      }
-
-                      result.data = data;
-                    } catch (e) {
-                      result.data = line.substring(6);
+                    // Redact user_id in SSE events if present
+                    if (data.user_id) {
+                      data.user_id = "[REDACTED]";
                     }
+
+                    result.data = data;
+                  } catch (e) {
+                    result.data = line.substring(6);
                   }
                 }
-                return result;
-              });
-          } catch (e) {
-            responseData.sseParseError = e.message;
-          }
-        } else {
-          // For non-SSE responses, try to parse as JSON
-          try {
-            const parsedBody = JSON.parse(responseBody);
-
-            // Redact sensitive information
-            if (parsedBody.user_id) {
-              parsedBody.user_id = "[REDACTED]";
-            }
-
-            responseData.parsedBody = parsedBody;
-          } catch (e) {
-            // If not JSON, store the body (with sensitive data redacted)
-            responseData.body = redactSensitiveInfo(responseBody);
-          }
+              }
+              return result;
+            });
+        } catch (e) {
+          responseData.sseParseError = e.message;
         }
+      } else {
+        // For non-SSE responses, try to parse as JSON
+        try {
+          const parsedBody = JSON.parse(responseBody);
 
-        logEntry.response = responseData;
-      });
+          // Redact sensitive information
+          if (parsedBody.user_id) {
+            parsedBody.user_id = "[REDACTED]";
+          }
+
+          responseData.parsedBody = parsedBody;
+        } catch (e) {
+          // If not JSON, store the body (with sensitive data redacted)
+          responseData.body = redactSensitiveInfo(responseBody);
+        }
+      }
+
+      logEntry.response = responseData;
     });
-  }
+  });
 }
 
 // Write logs function - can be called explicitly or on exit

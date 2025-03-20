@@ -2,7 +2,7 @@
 
 /**
  * Claude API Logger - Captures Claude API requests and responses
- * Usage: claude-log [--log_dir=DIR] [--save-responses] [claude options]
+ * Usage: claude-log [--log_dir=DIR] [claude options]
  */
 
 const fs = require("fs");
@@ -14,7 +14,6 @@ const os = require("os");
 // Parse command line arguments
 const args = process.argv.slice(2);
 let logDir = path.join(os.homedir(), ".claude_logs");
-let skipResponses = true;
 let printDebug = false;
 let claudeArgs = [];
 
@@ -26,8 +25,6 @@ for (let i = 0; i < args.length; i++) {
   } else if (arg === "--log_dir" && i < args.length - 1) {
     logDir = args[i + 1];
     i++;
-  } else if (arg === "--save-responses") {
-    skipResponses = false;
   } else if (arg === "--print") {
     printDebug = true;
   } else {
@@ -59,7 +56,6 @@ console.log("Initializing request capture...");
 const captureEnv = {
   ...process.env,
   CLAUDE_API_LOG_FILE: logFile,
-  CLAUDE_LOG_RESPONSES: skipResponses ? "false" : "true",
   CLAUDE_DEBUG: printDebug ? "true" : "false",
   NODE_OPTIONS: `--require "${path.join(__dirname, "direct_capture.js")}"`,
 };
