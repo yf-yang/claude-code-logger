@@ -4,15 +4,9 @@
  * Claude API Logger - Simple wrapper script
  */
 
-const { execSync } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+const path = require("path");
 
 // Locate the claude-logger main script
-const mainScriptPath = path.resolve(__dirname, '../claude_logger.js');
-
-// Forward all arguments to the main script
-process.argv.splice(1, 1);
-process.argv[0] = mainScriptPath;
+const mainScriptPath = path.resolve(__dirname, "../claude_logger.js");
 
 require(mainScriptPath);

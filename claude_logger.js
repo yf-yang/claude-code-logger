@@ -2,7 +2,7 @@
 
 /**
  * Claude API Logger - Captures Claude API requests and responses
- * Usage: claude-log [--log_dir=DIR] [--save-responses] [claude options]
+ * Usage: claude-log [--log_dir=DIR] [claude options]
  */
 
 const fs = require("fs");
@@ -14,7 +14,6 @@ const os = require("os");
 // Parse command line arguments
 const args = process.argv.slice(2);
 let logDir = path.join(os.homedir(), ".claude_logs");
-let skipResponses = true;
 let printDebug = false;
 let claudeArgs = [];
 
@@ -26,8 +25,6 @@ for (let i = 0; i < args.length; i++) {
   } else if (arg === "--log_dir" && i < args.length - 1) {
     logDir = args[i + 1];
     i++;
-  } else if (arg === "--save-responses") {
-    skipResponses = false;
   } else if (arg === "--print") {
     printDebug = true;
   } else {
@@ -44,8 +41,12 @@ if (!fs.existsSync(absoluteLogDir)) {
 // Generate unique identifiers for this run
 const timestamp = new Date().toISOString().replace(/:/g, "-");
 const runId = `${timestamp}_${crypto.randomBytes(4).toString("hex")}`;
+const logFile = path.join(absoluteLogDir, `${runId}.json`);
 
-console.log("Starting Claude" + (claudeArgs.includes("-p") ? " with prompt" : " in interactive mode"));
+console.log(
+  "Starting Claude" +
+    (claudeArgs.includes("-p") ? " with prompt" : " in interactive mode")
+);
 console.log(`Logs will be saved to: ${absoluteLogDir}`);
 
 // Run Claude with our direct_capture.js module loaded to intercept requests
@@ -54,9 +55,7 @@ console.log("Initializing request capture...");
 // Set up environment for direct_capture.js
 const captureEnv = {
   ...process.env,
-  CLAUDE_API_LOG_DIR: absoluteLogDir,
-  CLAUDE_API_LOG_NAME: runId,
-  CLAUDE_LOG_RESPONSES: skipResponses ? "false" : "true",
+  CLAUDE_API_LOG_FILE: logFile,
   CLAUDE_DEBUG: printDebug ? "true" : "false",
   NODE_OPTIONS: `--require "${path.join(__dirname, "direct_capture.js")}"`,
 };
@@ -88,15 +87,12 @@ claudeProcess.stderr.on("data", (data) => {
 
 // Handle process exit
 claudeProcess.on("close", (code) => {
-  if (code === 0) {
-    console.log(`\nClaude execution complete!`);
-    console.log(`Check the ${absoluteLogDir} directory for log files with ID ${runId}`);
-  } else {
-    console.error(`\nClaude process exited with code ${code}`);
-  }
+  console.log(`Logs written to ${logFile}`);
+  process.exit(code);
 });
 
 claudeProcess.on("error", (err) => {
+  console.log(`Logs written to ${logFile}`);
   console.error(`Error running Claude: ${err.message}`);
   process.exit(1);
 });
