@@ -14,10 +14,15 @@ const zlib = require("zlib");
 
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
+const projectName = process.env.CLAUDE_PROJECT_NAME || "project";
 const debugMode = process.env.CLAUDE_DEBUG === "true";
+const version = process.env.CLAUDE_LOGGER_VERSION || "unknown";
 
 // In-memory store for accumulating logs
 const apiLogs = [];
+
+// Log startup with version information
+debugLog(`Claude Logger v${version} started`);
 
 // Sensitive data patterns to redact
 const sensitivePatterns = [
@@ -115,15 +120,26 @@ function logRequest(protocol, options, req, url) {
 
   debugLog(`Found Claude API request to: ${url}`);
 
+  // Get current datetime for the log entry
+  const timestamp = new Date().toISOString();
+  
   // Create log data object with request/response structure
   const logEntry = {
     request: {
-      timestamp: new Date().toISOString(),
+      timestamp: timestamp,
       protocol: protocol,
       url: url,
     },
     response: null, // Will be populated when response is received
   };
+  
+  // Add project metadata
+  logEntry.project = {
+    name: projectName,
+    timestamp: timestamp,
+    version: version
+  };
+  
   apiLogs.push(logEntry);
 
   // Add method and headers if available (with sensitive data redacted)
@@ -284,10 +300,13 @@ function writeLogsToFile() {
     return;
   }
 
-  debugLog("Writing captured Claude API logs to file...");
+  debugLog("Writing captured Claude API logs to files...");
 
+  // Format logs as JSON
+  const logsContent = JSON.stringify(apiLogs, null, 2);
+  
+  // Save to log file
   try {
-    const logsContent = JSON.stringify(apiLogs, null, 2);
     fs.writeFileSync(logFile, logsContent);
     debugLog(`API logs saved to: ${logFile}`);
   } catch (err) {
@@ -298,13 +317,7 @@ function writeLogsToFile() {
 // Handle logs on exit
 process.on("exit", writeLogsToFile);
 
-// Try to write an empty array to make sure we can write to the files
-try {
-  fs.writeFileSync(logFile, "[]");
-  debugLog(`Successfully created test log file: ${logFile}`);
-} catch (err) {
-  console.error(`ERROR: Cannot write to log file: ${err.message}`);
-}
+// Log file creation is already tested in claude_logger.js
 
 // If running directly and not as a module
 if (require.main === module) {
@@ -328,5 +341,5 @@ if (require.main === module) {
 module.exports = {
   apiLogs,
   writeLogsToFile,
-  logFile,
+  logFile
 };

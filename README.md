@@ -43,7 +43,6 @@ All arguments after the options are passed directly to the Claude CLI.
 
 ### Options
 
-- `--log_dir=DIR`: Directory to save logs (default: ~/.claude_logs)
 - `--print`: Show debug messages (default: off)
 
 ### Examples
@@ -55,8 +54,8 @@ claude-log
 # Run Claude with a prompt
 claude-log -p "What is Rust and why do people care?"
 
-# Specify a custom log directory
-claude-log --log_dir=/path/to/logs
+# Enable debug mode to show more verbose output
+claude-log --print
 ```
 
 ## Setting up an alias
@@ -82,4 +81,6 @@ This lets you use `claude` as normal, but with all API calls logged.
 
 ## Log Files
 
-Logs are stored in `~/.claude_logs` by default, organized by timestamp.
+Log files are stored in a `logs` directory within your current project. These logs follow the format `project-name_timestamp.json`.
+
+The log files are formatted as a JSON array of request/response objects with metadata about the session.
