@@ -2,3 +2,5 @@
 .DS_Store
 /logs
 package-lock.json
+
+**/.claude/settings.local.json

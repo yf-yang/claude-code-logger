@@ -1,6 +1,6 @@
 {
   "name": "claude-logger",
-  "version": "1.0.0",
+  "version": "1.2.4",
   "description": "Log Anthropic API calls made through the Claude CLI",
   "main": "claude_logger.js",
   "bin": {
