@@ -14,13 +14,19 @@ const zlib = require("zlib");
 
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
+const projectName = process.env.CLAUDE_PROJECT_NAME || "project";
 const debugMode = process.env.CLAUDE_DEBUG === "true";
+const version = process.env.CLAUDE_LOGGER_VERSION || "unknown";
 
 // In-memory store for accumulating logs
 const apiLogs = [];
 
+// Log startup with version information
+debugLog(`Claude Logger v${version} started`);
+
 // Sensitive data patterns to redact
 const sensitivePatterns = [
+  // Header-related patterns
   {
     regex: /"x-api-key":\s*"([^"]+)"/g,
     replacement: '"x-api-key": "[REDACTED]"',
@@ -29,11 +35,40 @@ const sensitivePatterns = [
     regex: /"Authorization":\s*"([^"]+)"/gi,
     replacement: '"Authorization": "[REDACTED]"',
   },
-  { regex: /"user_id":\s*"([^"]+)"/g, replacement: '"user_id": "[REDACTED]"' },
-  {
-    regex: /"session_id":\s*"([^"]+)"/g,
-    replacement: '"session_id": "[REDACTED]"',
-  },
+  
+  // User identification patterns
+  // JSON format patterns (for request/response bodies)
+  { regex: /"(user_id|account_id|account_uuid)":\s*"([^"]+)"/g, replacement: '"$1": "[REDACTED]"' },
+  // URL parameter patterns (for query strings)
+  { regex: /(user_id|account_id|account_uuid)=([^&"\s]+)/g, replacement: '$1=[REDACTED]' },
+  
+  // Organization patterns
+  // JSON format patterns (for request/response bodies)
+  { regex: /"(organization_id|org_id)":\s*"([^"]+)"/g, replacement: '"$1": "[REDACTED]"' },
+  // URL parameter patterns (for query strings)
+  { regex: /(organization_id|org_id)=([^&"\s]+)/g, replacement: '$1=[REDACTED]' },
+  
+  // Session-related patterns
+  // JSON format pattern (for request/response bodies)
+  { regex: /"session_id":\s*"([^"]+)"/g, replacement: '"session_id": "[REDACTED]"' },
+  // URL parameter pattern (for query strings)
+  { regex: /session_id=([^&"\s]+)/g, replacement: 'session_id=[REDACTED]' },
+  
+  // Token and authentication patterns
+  // JSON format patterns (for request/response bodies)
+  { regex: /"(token|refresh_token|access_token)":\s*"([^"]+)"/g, replacement: '"$1": "[REDACTED]"' },
+  
+  // API key patterns
+  // JSON format pattern (for request/response bodies)
+  { regex: /"api_key":\s*"([^"]+)"/g, replacement: '"api_key": "[REDACTED]"' },
+  // URL parameter pattern (for query strings)
+  { regex: /api_key=([^&"\s]+)/g, replacement: 'api_key=[REDACTED]' },
+  
+  // UUID patterns (commonly used for identifiers)
+  { regex: /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi, replacement: '[UUID_REDACTED]' },
+  
+  // Email patterns (for privacy)
+  { regex: /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/g, replacement: '[EMAIL_REDACTED]' },
 ];
 
 // Debug logging function that only logs when debug mode is enabled
@@ -115,15 +150,26 @@ function logRequest(protocol, options, req, url) {
 
   debugLog(`Found Claude API request to: ${url}`);
 
+  // Get current datetime for the log entry
+  const timestamp = new Date().toISOString();
+  
   // Create log data object with request/response structure
   const logEntry = {
     request: {
-      timestamp: new Date().toISOString(),
+      timestamp: timestamp,
       protocol: protocol,
       url: url,
     },
     response: null, // Will be populated when response is received
   };
+  
+  // Add project metadata
+  logEntry.project = {
+    name: projectName,
+    timestamp: timestamp,
+    version: version
+  };
+  
   apiLogs.push(logEntry);
 
   // Add method and headers if available (with sensitive data redacted)
@@ -277,56 +323,151 @@ function logRequest(protocol, options, req, url) {
   });
 }
 
-// Write logs function - can be called explicitly or on exit
+// Track which logs have been written to file
+let lastWrittenLogIndex = -1;
+
+
+/**
+ * Writes accumulated logs to the log file
+ * Handles errors gracefully and creates backups when necessary
+ * @returns {boolean} - True if logs were written successfully, false otherwise
+ */
 function writeLogsToFile() {
-  if (apiLogs.length === 0) {
-    debugLog("No Claude API requests were captured in this session.");
-    return;
+  // Exit early if there are no new logs to write
+  if (apiLogs.length === 0 || lastWrittenLogIndex === apiLogs.length - 1) {
+    debugLog("No new Claude API requests to write.");
+    return true;
   }
 
-  debugLog("Writing captured Claude API logs to file...");
+  debugLog(`Writing logs: ${lastWrittenLogIndex + 1} to ${apiLogs.length - 1}`);
 
   try {
-    const logsContent = JSON.stringify(apiLogs, null, 2);
-    fs.writeFileSync(logFile, logsContent);
+    // Get only the logs that haven't been written yet
+    const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
+    
+    // Ensure parent directory exists
+    const logFileDir = require('path').dirname(logFile);
+    if (!fs.existsSync(logFileDir)) {
+      fs.mkdirSync(logFileDir, { recursive: true });
+      debugLog(`Created log directory: ${logFileDir}`);
+    }
+    
+    // Read and parse existing logs if the file exists
+    let allLogs = [];
+    if (fs.existsSync(logFile)) {
+      try {
+        const content = fs.readFileSync(logFile, 'utf8');
+        if (content && content.trim() !== '[]') {
+          allLogs = JSON.parse(content);
+          // Validate that we have an array
+          if (!Array.isArray(allLogs)) {
+            throw new Error("Existing log file does not contain a valid array");
+          }
+        }
+      } catch (parseErr) {
+        debugLog(`Error parsing existing log file: ${parseErr.message}`);
+        
+        // Create a backup of the original file instead of overwriting
+        const backupFile = `${logFile}.backup-${Date.now()}`;
+        try {
+          fs.copyFileSync(logFile, backupFile);
+          debugLog(`Backed up original log file to: ${backupFile}`);
+        } catch (backupErr) {
+          console.error(`Failed to create backup of corrupted log file: ${backupErr.message}`);
+        }
+        
+        // Start fresh with an empty array
+        allLogs = [];
+      }
+    }
+
+    // Combine existing logs with new logs
+    allLogs = allLogs.concat(newLogs);
+    
+    // Format logs as JSON
+    const logsContent = JSON.stringify(allLogs, null, 2);
+    
+    // Save to log file (write to temp file first, then rename for atomicity)
+    const tempLogFile = `${logFile}.temp-${Date.now()}`;
+    fs.writeFileSync(tempLogFile, logsContent);
+    fs.renameSync(tempLogFile, logFile);
     debugLog(`API logs saved to: ${logFile}`);
+    
+    // Update the last written index
+    lastWrittenLogIndex = apiLogs.length - 1;
+    return true;
   } catch (err) {
     console.error(`Error writing logs: ${err.message}`);
+    return false;
   }
 }
 
-// Handle logs on exit
-process.on("exit", writeLogsToFile);
+// Set up a periodic log writing interval (every 5 seconds)
+const logInterval = setInterval(() => {
+  if (apiLogs.length > 0) {
+    writeLogsToFile();
+  }
+}, 5000);
 
-// Try to write an empty array to make sure we can write to the files
-try {
-  fs.writeFileSync(logFile, "[]");
-  debugLog(`Successfully created test log file: ${logFile}`);
-} catch (err) {
-  console.error(`ERROR: Cannot write to log file: ${err.message}`);
+/**
+ * Set up process signal handlers to ensure logs are written before exit
+ */
+function setupSignalHandlers() {
+  // Handle normal exit
+  process.on("exit", () => {
+    clearInterval(logInterval);
+    writeLogsToFile();
+    debugLog("Claude logger exiting gracefully");
+  });
+
+  // Handle termination signals
+  const handleSignal = (signal) => {
+    return () => {
+      debugLog(`Capture process received ${signal}, flushing logs and exiting`);
+      clearInterval(logInterval);
+      writeLogsToFile();
+      process.exit(0);  // Exit with success code
+    };
+  };
+
+  // Set up handlers for common termination signals
+  process.on("SIGTERM", handleSignal("SIGTERM"));
+  process.on("SIGINT", handleSignal("SIGINT"));
+  
+  // Handle uncaught exceptions - attempt to save logs before crashing
+  process.on("uncaughtException", (err) => {
+    console.error(`FATAL: Uncaught exception: ${err.message}`);
+    console.error(err.stack);
+    clearInterval(logInterval);
+    writeLogsToFile();
+    process.exit(1);  // Exit with error code
+  });
 }
+
+// Set up signal handlers
+setupSignalHandlers();
 
 // If running directly and not as a module
 if (require.main === module) {
   debugLog("Direct capture module loaded, HTTP/HTTPS interception active");
-
-  // Listen for termination signals
-  process.on("SIGTERM", () => {
-    debugLog("Capture process received SIGTERM, exiting");
-    writeLogsToFile();
-    process.exit(1);
-  });
-
-  process.on("SIGINT", () => {
-    debugLog("Capture process received SIGINT, exiting");
-    writeLogsToFile();
-    process.exit(1);
-  });
+  console.log(`Claude API Logger v${version} started - capturing requests to anthropic.com`);
 }
 
-// Make this module available for use
+/**
+ * Module exports for the Claude API Direct Capture
+ * @module claude-logger/direct-capture
+ */
 module.exports = {
+  // Expose the log data structure - can be used by parent module
   apiLogs,
+  
+  // Core functions
   writeLogsToFile,
+  redactSensitiveInfo,
+  
+  // Log file paths
   logFile,
+  
+  // Configuration
+  debugMode
 };
