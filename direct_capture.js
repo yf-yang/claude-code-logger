@@ -234,16 +234,24 @@ function logRequest(protocol, options, req, url) {
   if (typeof options === "object") {
     logEntry.request.method = options.method || "GET";
 
-    // Deep copy and redact headers
+    // Copy headers (avoid deep copy which might fail on non-plain objects)
     if (options.headers) {
-      logEntry.request.headers = JSON.parse(JSON.stringify(options.headers));
-
-      // Explicitly redact sensitive headers (case-insensitive)
-      for (const key in logEntry.request.headers) {
-        const lowerKey = key.toLowerCase();
-        if (lowerKey === "x-api-key" || lowerKey === "authorization") {
-          logEntry.request.headers[key] = "[REDACTED]";
+      logEntry.request.headers = {};
+      try {
+        // Copy headers safely
+        for (const key in options.headers) {
+          if (options.headers.hasOwnProperty(key)) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === "x-api-key" || lowerKey === "authorization") {
+              logEntry.request.headers[key] = "[REDACTED]";
+            } else {
+              logEntry.request.headers[key] = String(options.headers[key]);
+            }
+          }
         }
+      } catch (e) {
+        debugLog(`Error copying headers: ${e.message}`);
+        logEntry.request.headers = { error: "Failed to copy headers" };
       }
     } else {
       logEntry.request.headers = {};
@@ -371,9 +379,17 @@ function logRequest(protocol, options, req, url) {
       }
     }, timeoutDuration);
     
+    // Important: Set up data handler immediately to ensure stream flows
+    // and doesn't cause backpressure that could lead to timeouts
     res.on("data", (chunk) => {
       responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       debugLog(`Response chunk received: ${chunk.length} bytes`);
+      
+      // For very large responses (>10MB), consider dropping old chunks to prevent memory issues
+      const totalSize = responseChunks.reduce((sum, c) => sum + c.length, 0);
+      if (totalSize > 10 * 1024 * 1024) { // 10MB limit
+        debugLog(`Warning: Large response detected (${totalSize} bytes), may impact performance`);
+      }
     });
 
     // Process complete response
@@ -406,11 +422,12 @@ function logRequest(protocol, options, req, url) {
         if (!streamingLogWritten) {
           logEntry.response = responseData;
           
-          // Still trigger write even on error
-          debugLog("Response error, triggering log write");
-          setImmediate(() => {
-            writeLogsToFile();
-          });
+          // Log the error response
+          if (jsonLinesLogger) {
+            jsonLinesLogger.log(logEntry).catch(err => {
+              console.error('Error logging response error:', err);
+            });
+          }
         }
         return;
       }
@@ -537,6 +554,11 @@ function logRequest(protocol, options, req, url) {
     debugLog(`Request error for ${requestId}: ${error.message}`);
     logEntry.request.error = error.message;
     
+    // Check if this is an abort-related error
+    if (error.code === 'ECONNRESET' && error.message.includes('aborted')) {
+      debugLog(`Request aborted via ECONNRESET for ${requestId}`);
+    }
+    
     // Create minimal response entry for failed requests
     if (!logEntry.response) {
       logEntry.response = {
@@ -581,13 +603,14 @@ function logRequest(protocol, options, req, url) {
   });
   
   // Handle request abort/destroy
-  req.on('abort', () => {
-    debugLog(`Request aborted for ${requestId}`);
+  // Note: 'abort' event is deprecated in newer Node versions, but we'll handle both for compatibility
+  const handleAbort = (reason) => {
+    debugLog(`Request aborted for ${requestId}: ${reason}`);
     if (!logEntry.response) {
       logEntry.response = {
         timestamp: new Date().toISOString(),
         error: 'Request aborted - this may be due to Claude CLI timeout during compaction or other long operations',
-        abortReason: 'Client cancelled request'
+        abortReason: reason || 'Client cancelled request'
       };
       if (jsonLinesLogger) {
         jsonLinesLogger.log(logEntry).catch(err => {
@@ -595,7 +618,9 @@ function logRequest(protocol, options, req, url) {
         });
       }
     }
-  });
+  };
+  
+  req.on('abort', () => handleAbort('abort event'));
   
   req.on('close', () => {
     debugLog(`Request closed for ${requestId}`);
@@ -614,168 +639,6 @@ function logRequest(protocol, options, req, url) {
   });
 }
 
-// Track which logs have been written to file
-let lastWrittenLogIndex = -1;
-
-// Maximum number of logs to keep in memory before forcing a write
-const MAX_LOGS_IN_MEMORY = 50;
-
-// Force immediate write after completing a request/response pair
-let pendingWrites = 0;
-
-// Queue for pending write operations
-const writeQueue = [];
-
-
-/**
- * Writes accumulated logs to the log file
- * Handles errors gracefully and creates backups when necessary
- * @returns {boolean} - True if logs were written successfully, false otherwise
- */
-function writeLogsToFile(forceWrite = false) {
-  // Exit early if there are no new logs to write
-  if (apiLogs.length === 0 || lastWrittenLogIndex >= apiLogs.length - 1) {
-    debugLog("No new Claude API requests to write.");
-    
-    // Process any queued writes
-    if (writeQueue.length > 0 && pendingWrites === 0) {
-      const queuedWrite = writeQueue.shift();
-      if (queuedWrite) {
-        debugLog("Processing queued write request");
-        setImmediate(() => writeLogsToFile());
-      }
-    }
-    return true;
-  }
-
-  // Queue this write if one is already in progress
-  if (pendingWrites > 0) {
-    debugLog("Write already in progress, queueing...");
-    writeQueue.push(Date.now());
-    return false;
-  }
-  
-  pendingWrites++;
-  
-  // Capture the current state to avoid race conditions
-  const currentLogCount = apiLogs.length;
-  const startIndex = lastWrittenLogIndex + 1;
-  
-  // Filter logs to only include those with responses (unless forceWrite is true)
-  let logsToWrite = [];
-  let lastCompleteIndex = lastWrittenLogIndex;
-  
-  for (let i = startIndex; i < currentLogCount; i++) {
-    const log = apiLogs[i];
-    if (forceWrite || log.response !== null) {
-      logsToWrite.push(log);
-      lastCompleteIndex = i;
-    } else {
-      // Stop at the first incomplete log (unless force writing)
-      if (!forceWrite) {
-        break;
-      }
-    }
-  }
-  
-  // If no complete logs to write, exit early
-  if (logsToWrite.length === 0 && !forceWrite) {
-    debugLog("No complete logs to write yet.");
-    pendingWrites--;
-    return false;
-  }
-  
-  debugLog(`Writing ${logsToWrite.length} complete logs (indices ${startIndex} to ${lastCompleteIndex})`);
-
-  try {
-    // Ensure parent directory exists
-    const logFileDir = require('path').dirname(logFile);
-    if (!fs.existsSync(logFileDir)) {
-      fs.mkdirSync(logFileDir, { recursive: true });
-      debugLog(`Created log directory: ${logFileDir}`);
-    }
-    
-    // Read and parse existing logs if the file exists
-    let allLogs = [];
-    if (fs.existsSync(logFile)) {
-      try {
-        const content = fs.readFileSync(logFile, 'utf8');
-        if (content && content.trim() !== '[]') {
-          allLogs = JSON.parse(content);
-          // Validate that we have an array
-          if (!Array.isArray(allLogs)) {
-            throw new Error("Existing log file does not contain a valid array");
-          }
-        }
-      } catch (parseErr) {
-        debugLog(`Error parsing existing log file: ${parseErr.message}`);
-        
-        // Create a backup of the original file instead of overwriting
-        const backupFile = `${logFile}.backup-${Date.now()}`;
-        try {
-          fs.copyFileSync(logFile, backupFile);
-          debugLog(`Backed up original log file to: ${backupFile}`);
-        } catch (backupErr) {
-          console.error(`Failed to create backup of corrupted log file: ${backupErr.message}`);
-        }
-        
-        // Start fresh with an empty array
-        allLogs = [];
-      }
-    }
-
-    // Combine existing logs with new logs
-    allLogs = allLogs.concat(logsToWrite);
-    
-    // Format logs as JSON
-    const logsContent = JSON.stringify(allLogs, null, 2);
-    
-    // Save to log file (write to temp file first, then rename for atomicity)
-    const tempLogFile = `${logFile}.temp-${Date.now()}`;
-    fs.writeFileSync(tempLogFile, logsContent);
-    fs.renameSync(tempLogFile, logFile);
-    debugLog(`API logs saved to: ${logFile} (${logsToWrite.length} new entries)`);
-    
-    // Update the last written index to what we actually wrote
-    lastWrittenLogIndex = lastCompleteIndex;
-    
-    // Don't clean up memory immediately - let it accumulate a bit more
-    // This prevents losing logs that might be added during cleanup
-    if (apiLogs.length > MAX_LOGS_IN_MEMORY * 3) {
-      // Only remove logs that we're certain have been written
-      const safeRemoveCount = Math.min(lastWrittenLogIndex + 1, apiLogs.length - MAX_LOGS_IN_MEMORY);
-      if (safeRemoveCount > 0) {
-        debugLog(`Cleaning up memory: removing ${safeRemoveCount} written logs`);
-        apiLogs.splice(0, safeRemoveCount);
-        lastWrittenLogIndex -= safeRemoveCount;
-      }
-    }
-    
-    pendingWrites--;
-    
-    // Process any queued writes
-    if (writeQueue.length > 0) {
-      const queuedWrite = writeQueue.shift();
-      if (queuedWrite) {
-        debugLog("Processing queued write after successful write");
-        setImmediate(() => writeLogsToFile());
-      }
-    }
-    
-    return true;
-  } catch (err) {
-    console.error(`Error writing logs: ${err.message}`);
-    pendingWrites--;
-    
-    // Schedule retry for failed writes
-    setTimeout(() => {
-      debugLog("Retrying failed write...");
-      writeLogsToFile();
-    }, 1000);
-    
-    return false;
-  }
-}
 
 // JSON Lines logger handles its own periodic flushing and memory management
 
@@ -814,8 +677,10 @@ function setupSignalHandlers() {
   process.on("uncaughtException", (err) => {
     console.error(`FATAL: Uncaught exception: ${err.message}`);
     console.error(err.stack);
-    clearInterval(logInterval);
-    writeLogsToFile();
+    // JSON Lines logger will handle flushing
+    if (jsonLinesLogger) {
+      jsonLinesLogger.close();
+    }
     process.exit(1);  // Exit with error code
   });
 }
