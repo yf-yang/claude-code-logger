@@ -82,8 +82,16 @@ function debugLog(message) {
 const originalHttpRequest = http.request;
 const originalHttpsRequest = https.request;
 
+debugLog("Patching http/https request methods");
+
+// Counter for tracking requests
+let requestCounter = 0;
+
 // Store original fetch if it exists
 const originalFetch = global.fetch;
+
+// Track active connections for debugging
+const activeConnections = new Map();
 
 // Patch the http.request method
 http.request = function () {
@@ -102,6 +110,18 @@ http.request = function () {
 
   // Call original and capture request object
   const req = originalHttpRequest.apply(this, arguments);
+
+  // Track connection reuse
+  if (req.socket) {
+    const socketKey = `${req.socket.localAddress}:${req.socket.localPort}->${req.socket.remoteAddress}:${req.socket.remotePort}`;
+    if (activeConnections.has(socketKey)) {
+      debugLog(`Reusing existing connection: ${socketKey}`);
+      activeConnections.set(socketKey, activeConnections.get(socketKey) + 1);
+    } else {
+      debugLog(`New connection established: ${socketKey}`);
+      activeConnections.set(socketKey, 1);
+    }
+  }
 
   // Log request details
   logRequest("http", options, req, url);
@@ -124,8 +144,23 @@ https.request = function () {
     url = `https://${options.hostname || options.host}${options.path || "/"}`;
   }
 
+  debugLog(`Request details - URL: ${url}, Method: ${options.method || 'GET'}`);
+
   // Call original and capture request object
   const req = originalHttpsRequest.apply(this, arguments);
+
+  // Track connection reuse for HTTPS
+  req.on('socket', (socket) => {
+    const socketKey = `${socket.localAddress || 'unknown'}:${socket.localPort || 'unknown'}->${socket.remoteAddress || options.hostname}:${socket.remotePort || options.port || 443}`;
+    if (activeConnections.has(socketKey)) {
+      const count = activeConnections.get(socketKey) + 1;
+      debugLog(`HTTPS: Reusing existing connection: ${socketKey} (request #${count})`);
+      activeConnections.set(socketKey, count);
+    } else {
+      debugLog(`HTTPS: New connection established: ${socketKey}`);
+      activeConnections.set(socketKey, 1);
+    }
+  });
 
   // Log request details
   logRequest("https", options, req, url);
@@ -146,18 +181,26 @@ function redactSensitiveInfo(str) {
 
 // Log a request and its response
 function logRequest(protocol, options, req, url) {
+  // Log all requests for debugging
+  debugLog(`Intercepted ${protocol} request to: ${url}`);
+  
   // Skip non-Claude API requests
   if (!url.includes("anthropic.com")) {
+    debugLog(`Skipping non-Claude request: ${url}`);
     return;
   }
 
-  debugLog(`Found Claude API request to: ${url}`);
+  requestCounter++;
+  const requestId = `req-${Date.now()}-${requestCounter}`;
+  debugLog(`Found Claude API request #${requestCounter} (ID: ${requestId}) to: ${url}`);
+  debugLog(`Total API logs in memory: ${apiLogs.length}`);
 
   // Get current datetime for the log entry
   const timestamp = new Date().toISOString();
   
   // Create log data object with request/response structure
   const logEntry = {
+    requestId: requestId,
     request: {
       timestamp: timestamp,
       protocol: protocol,
@@ -165,6 +208,10 @@ function logRequest(protocol, options, req, url) {
     },
     response: null, // Will be populated when response is received
   };
+  
+  // Store requestId on the request object for later reference
+  req._logRequestId = requestId;
+  req._logEntry = logEntry;
   
   // Add project metadata
   logEntry.project = {
@@ -183,12 +230,12 @@ function logRequest(protocol, options, req, url) {
     if (options.headers) {
       logEntry.request.headers = JSON.parse(JSON.stringify(options.headers));
 
-      // Explicitly redact sensitive headers
-      if (logEntry.request.headers["x-api-key"]) {
-        logEntry.request.headers["x-api-key"] = "[REDACTED]";
-      }
-      if (logEntry.request.headers["authorization"]) {
-        logEntry.request.headers["authorization"] = "[REDACTED]";
+      // Explicitly redact sensitive headers (case-insensitive)
+      for (const key in logEntry.request.headers) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === "x-api-key" || lowerKey === "authorization") {
+          logEntry.request.headers[key] = "[REDACTED]";
+        }
       }
     } else {
       logEntry.request.headers = {};
@@ -201,12 +248,18 @@ function logRequest(protocol, options, req, url) {
   let requestBody = [];
 
   req.write = function (chunk) {
-    if (chunk) requestBody.push(chunk);
+    if (chunk) {
+      // Ensure chunk is a Buffer
+      requestBody.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
     return originalWrite.apply(this, arguments);
   };
 
   req.end = function (chunk) {
-    if (chunk) requestBody.push(chunk);
+    if (chunk) {
+      // Ensure chunk is a Buffer
+      requestBody.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
 
     // Add body to log data if we captured any
     if (requestBody.length > 0) {
@@ -245,12 +298,59 @@ function logRequest(protocol, options, req, url) {
 
     // Collect response body chunks
     const responseChunks = [];
+    let responseTimeout = null;
+    let isStreamingResponse = false;
+    let streamingLogWritten = false;
+    
+    // Check if this is a streaming response
+    if (res.headers["content-type"] && res.headers["content-type"].includes("text/event-stream")) {
+      isStreamingResponse = true;
+      debugLog("Detected streaming (SSE) response");
+      
+      // For streaming responses, log the request immediately with a placeholder response
+      responseData.streaming = true;
+      responseData.streamStarted = new Date().toISOString();
+      logEntry.response = responseData;
+      
+      // Write the initial request/response pair immediately for streaming
+      setImmediate(() => {
+        debugLog(`Writing initial log for streaming request ${req._logRequestId}`);
+        writeLogsToFile();
+        streamingLogWritten = true;
+      });
+    }
+    
+    // Set a timeout for response collection
+    // Use longer timeout for streaming responses (5 minutes vs 30 seconds)
+    const timeoutDuration = isStreamingResponse ? 300000 : 30000;
+    responseTimeout = setTimeout(() => {
+      debugLog(`Response timeout reached after ${timeoutDuration/1000}s, logging partial response`);
+      responseData.timeout = true;
+      responseData.partialBody = responseChunks.length > 0 ? 
+        `Partial response collected (${responseChunks.length} chunks, ${Buffer.concat(responseChunks).length} bytes)` : 
+        "No response data collected";
+      
+      // Don't overwrite if already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        // Trigger write for timeout
+        setImmediate(() => {
+          writeLogsToFile();
+        });
+      }
+    }, timeoutDuration);
+    
     res.on("data", (chunk) => {
       responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      debugLog(`Response chunk received: ${chunk.length} bytes`);
     });
 
     // Process complete response
     res.on("end", () => {
+      // Clear timeout since response completed
+      if (responseTimeout) {
+        clearTimeout(responseTimeout);
+      }
       let responseBody = "";
       try {
         const buffer = Buffer.concat(responseChunks);
@@ -270,7 +370,17 @@ function logRequest(protocol, options, req, url) {
         }
       } catch (e) {
         responseData.bodyError = "Error processing response body: " + e.message;
-        logEntry.response = responseData;
+        
+        // Only update and write if not already written for streaming
+        if (!streamingLogWritten) {
+          logEntry.response = responseData;
+          
+          // Still trigger write even on error
+          debugLog("Response error, triggering log write");
+          setImmediate(() => {
+            writeLogsToFile();
+          });
+        }
         return;
       }
 
@@ -278,6 +388,7 @@ function logRequest(protocol, options, req, url) {
         res.headers["content-type"] &&
         res.headers["content-type"].includes("text/event-stream")
       ) {
+        debugLog(`Processing SSE response, total size: ${responseBody.length} bytes`);
         // Parse SSE responses
         try {
           responseData.events = responseBody
@@ -318,15 +429,83 @@ function logRequest(protocol, options, req, url) {
           if (parsedBody.user_id) {
             parsedBody.user_id = "[REDACTED]";
           }
+          
+          // Redact account information
+          if (parsedBody.account) {
+            if (parsedBody.account.uuid) parsedBody.account.uuid = "[REDACTED]";
+            if (parsedBody.account.email) parsedBody.account.email = "[EMAIL_REDACTED]";
+            if (parsedBody.account.full_name) parsedBody.account.full_name = "[REDACTED]";
+          }
+          
+          // Redact organization information
+          if (parsedBody.organization) {
+            if (parsedBody.organization.uuid) parsedBody.organization.uuid = "[REDACTED]";
+            if (parsedBody.organization.name) parsedBody.organization.name = "[REDACTED]";
+          }
 
-          responseData.parsedBody = parsedBody;
+          responseData.body = parsedBody;
         } catch (e) {
           // If not JSON, store the body (with sensitive data redacted)
           responseData.body = redactSensitiveInfo(responseBody);
         }
       }
 
-      logEntry.response = responseData;
+      // Only update response if not already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        
+        // Trigger immediate write for completed request/response pairs
+        const reqId = req._logRequestId || 'unknown';
+        debugLog(`Response complete for request ${reqId}`);
+        debugLog(`Response had ${responseChunks.length} chunks, total size: ${Buffer.concat(responseChunks).length} bytes`);
+        debugLog(`Current apiLogs length: ${apiLogs.length}, lastWrittenLogIndex: ${lastWrittenLogIndex}`);
+        setImmediate(() => {
+          writeLogsToFile();
+        });
+      } else {
+        debugLog(`Streaming response ended for request ${req._logRequestId}, already logged`);
+      }
+    });
+    
+    // Also track response errors
+    res.on("error", (error) => {
+      const reqId = req._logRequestId || 'unknown';
+      debugLog(`Response error for request ${reqId}: ${error.message}`);
+      responseData.error = error.message;
+      
+      // Only update and write if not already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        
+        // Clear timeout on error
+        if (responseTimeout) {
+          clearTimeout(responseTimeout);
+        }
+        
+        // Trigger write on error
+        setImmediate(() => {
+          writeLogsToFile();
+        });
+      }
+    });
+  });
+  
+  // Track request errors
+  req.on("error", (error) => {
+    debugLog(`Request error for ${requestId}: ${error.message}`);
+    logEntry.request.error = error.message;
+    
+    // Create minimal response entry for failed requests
+    if (!logEntry.response) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: `Request failed: ${error.message}`
+      };
+    }
+    
+    // Trigger write on error
+    setImmediate(() => {
+      writeLogsToFile();
     });
   });
 }
@@ -334,25 +513,77 @@ function logRequest(protocol, options, req, url) {
 // Track which logs have been written to file
 let lastWrittenLogIndex = -1;
 
+// Maximum number of logs to keep in memory before forcing a write
+const MAX_LOGS_IN_MEMORY = 50;
+
+// Force immediate write after completing a request/response pair
+let pendingWrites = 0;
+
+// Queue for pending write operations
+const writeQueue = [];
+
 
 /**
  * Writes accumulated logs to the log file
  * Handles errors gracefully and creates backups when necessary
  * @returns {boolean} - True if logs were written successfully, false otherwise
  */
-function writeLogsToFile() {
+function writeLogsToFile(forceWrite = false) {
   // Exit early if there are no new logs to write
-  if (apiLogs.length === 0 || lastWrittenLogIndex === apiLogs.length - 1) {
+  if (apiLogs.length === 0 || lastWrittenLogIndex >= apiLogs.length - 1) {
     debugLog("No new Claude API requests to write.");
+    
+    // Process any queued writes
+    if (writeQueue.length > 0 && pendingWrites === 0) {
+      const queuedWrite = writeQueue.shift();
+      if (queuedWrite) {
+        debugLog("Processing queued write request");
+        setImmediate(() => writeLogsToFile());
+      }
+    }
     return true;
   }
 
-  debugLog(`Writing logs: ${lastWrittenLogIndex + 1} to ${apiLogs.length - 1}`);
+  // Queue this write if one is already in progress
+  if (pendingWrites > 0) {
+    debugLog("Write already in progress, queueing...");
+    writeQueue.push(Date.now());
+    return false;
+  }
+  
+  pendingWrites++;
+  
+  // Capture the current state to avoid race conditions
+  const currentLogCount = apiLogs.length;
+  const startIndex = lastWrittenLogIndex + 1;
+  
+  // Filter logs to only include those with responses (unless forceWrite is true)
+  let logsToWrite = [];
+  let lastCompleteIndex = lastWrittenLogIndex;
+  
+  for (let i = startIndex; i < currentLogCount; i++) {
+    const log = apiLogs[i];
+    if (forceWrite || log.response !== null) {
+      logsToWrite.push(log);
+      lastCompleteIndex = i;
+    } else {
+      // Stop at the first incomplete log (unless force writing)
+      if (!forceWrite) {
+        break;
+      }
+    }
+  }
+  
+  // If no complete logs to write, exit early
+  if (logsToWrite.length === 0 && !forceWrite) {
+    debugLog("No complete logs to write yet.");
+    pendingWrites--;
+    return false;
+  }
+  
+  debugLog(`Writing ${logsToWrite.length} complete logs (indices ${startIndex} to ${lastCompleteIndex})`);
 
   try {
-    // Get only the logs that haven't been written yet
-    const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
-    
     // Ensure parent directory exists
     const logFileDir = require('path').dirname(logFile);
     if (!fs.existsSync(logFileDir)) {
@@ -390,7 +621,7 @@ function writeLogsToFile() {
     }
 
     // Combine existing logs with new logs
-    allLogs = allLogs.concat(newLogs);
+    allLogs = allLogs.concat(logsToWrite);
     
     // Format logs as JSON
     const logsContent = JSON.stringify(allLogs, null, 2);
@@ -399,23 +630,65 @@ function writeLogsToFile() {
     const tempLogFile = `${logFile}.temp-${Date.now()}`;
     fs.writeFileSync(tempLogFile, logsContent);
     fs.renameSync(tempLogFile, logFile);
-    debugLog(`API logs saved to: ${logFile}`);
+    debugLog(`API logs saved to: ${logFile} (${logsToWrite.length} new entries)`);
     
-    // Update the last written index
-    lastWrittenLogIndex = apiLogs.length - 1;
+    // Update the last written index to what we actually wrote
+    lastWrittenLogIndex = lastCompleteIndex;
+    
+    // Don't clean up memory immediately - let it accumulate a bit more
+    // This prevents losing logs that might be added during cleanup
+    if (apiLogs.length > MAX_LOGS_IN_MEMORY * 3) {
+      // Only remove logs that we're certain have been written
+      const safeRemoveCount = Math.min(lastWrittenLogIndex + 1, apiLogs.length - MAX_LOGS_IN_MEMORY);
+      if (safeRemoveCount > 0) {
+        debugLog(`Cleaning up memory: removing ${safeRemoveCount} written logs`);
+        apiLogs.splice(0, safeRemoveCount);
+        lastWrittenLogIndex -= safeRemoveCount;
+      }
+    }
+    
+    pendingWrites--;
+    
+    // Process any queued writes
+    if (writeQueue.length > 0) {
+      const queuedWrite = writeQueue.shift();
+      if (queuedWrite) {
+        debugLog("Processing queued write after successful write");
+        setImmediate(() => writeLogsToFile());
+      }
+    }
+    
     return true;
   } catch (err) {
     console.error(`Error writing logs: ${err.message}`);
+    pendingWrites--;
+    
+    // Schedule retry for failed writes
+    setTimeout(() => {
+      debugLog("Retrying failed write...");
+      writeLogsToFile();
+    }, 1000);
+    
     return false;
   }
 }
 
-// Set up a periodic log writing interval (every 5 seconds)
+// Set up a periodic log writing interval (every 2 seconds for more responsive logging)
 const logInterval = setInterval(() => {
-  if (apiLogs.length > 0) {
+  if (apiLogs.length > lastWrittenLogIndex + 1) {
+    debugLog(`Periodic write check: ${apiLogs.length - lastWrittenLogIndex - 1} new logs to write`);
     writeLogsToFile();
   }
-}, 5000);
+}, 2000);
+
+// Also force write if we accumulate too many logs in memory
+const memoryCheckInterval = setInterval(() => {
+  const unwrittenLogs = apiLogs.length - lastWrittenLogIndex - 1;
+  if (unwrittenLogs >= MAX_LOGS_IN_MEMORY) {
+    debugLog(`Force writing ${unwrittenLogs} logs due to memory limit`);
+    writeLogsToFile();
+  }
+}, 500);
 
 /**
  * Set up process signal handlers to ensure logs are written before exit
@@ -424,8 +697,29 @@ function setupSignalHandlers() {
   // Handle normal exit
   process.on("exit", () => {
     clearInterval(logInterval);
-    writeLogsToFile();
-    debugLog("Claude logger exiting gracefully");
+    clearInterval(memoryCheckInterval);
+    // Synchronously write any remaining logs (including those that might be in the queue)
+    const remainingLogs = apiLogs.length - lastWrittenLogIndex - 1;
+    if (remainingLogs > 0) {
+      debugLog(`Writing ${remainingLogs} remaining logs on exit (including incomplete ones)...`);
+      // Use synchronous file operations for exit handler
+      try {
+        const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
+        let allLogs = [];
+        if (fs.existsSync(logFile)) {
+          const content = fs.readFileSync(logFile, 'utf8');
+          if (content && content.trim() !== '[]') {
+            allLogs = JSON.parse(content);
+          }
+        }
+        allLogs = allLogs.concat(newLogs);
+        fs.writeFileSync(logFile, JSON.stringify(allLogs, null, 2));
+        debugLog(`Synchronously wrote ${newLogs.length} logs on exit`);
+      } catch (err) {
+        console.error(`Failed to write logs on exit: ${err.message}`);
+      }
+    }
+    debugLog(`Claude logger exiting gracefully (${writeQueue.length} queued writes discarded)`);
   });
 
   // Handle termination signals
@@ -433,7 +727,27 @@ function setupSignalHandlers() {
     return () => {
       debugLog(`Capture process received ${signal}, flushing logs and exiting`);
       clearInterval(logInterval);
-      writeLogsToFile();
+      clearInterval(memoryCheckInterval);
+      
+      // Try to write logs before exiting
+      if (apiLogs.length > lastWrittenLogIndex + 1) {
+        try {
+          const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
+          let allLogs = [];
+          if (fs.existsSync(logFile)) {
+            const content = fs.readFileSync(logFile, 'utf8');
+            if (content && content.trim() !== '[]') {
+              allLogs = JSON.parse(content);
+            }
+          }
+          allLogs = allLogs.concat(newLogs);
+          fs.writeFileSync(logFile, JSON.stringify(allLogs, null, 2));
+          console.log(`Flushed ${newLogs.length} logs before exit`);
+        } catch (err) {
+          console.error(`Failed to flush logs: ${err.message}`);
+        }
+      }
+      
       process.exit(0);  // Exit with success code
     };
   };
