@@ -555,23 +555,29 @@ function logRequest(protocol, options, req, url) {
   
   // Handle socket errors to prevent crashes
   req.on('socket', (socket) => {
-    // Remove any existing error listeners to prevent duplicates
-    socket.removeAllListeners('error');
-    socket.removeAllListeners('close');
+    // Store original listeners count to avoid interfering with existing handlers
+    const originalErrorListenerCount = socket.listenerCount('error');
+    const originalCloseListenerCount = socket.listenerCount('close');
     
-    socket.on('error', (error) => {
-      debugLog(`Socket error for ${requestId}: ${error.message}`);
-      // Don't let socket errors bubble up and crash the process
-      if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
-        debugLog(`Socket closed unexpectedly for ${requestId}`);
-      }
-    });
-    
-    socket.on('close', (hadError) => {
-      if (hadError) {
-        debugLog(`Socket closed with error for ${requestId}`);
-      }
-    });
+    // Only add our listeners if we haven't already
+    if (!socket._loggerListenersAdded) {
+      socket._loggerListenersAdded = true;
+      
+      // Add our error handler without removing existing ones
+      socket.prependListener('error', (error) => {
+        debugLog(`Socket error for ${requestId}: ${error.message}`);
+        // Log but don't prevent other handlers from running
+        if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+          debugLog(`Socket closed unexpectedly for ${requestId}`);
+        }
+      });
+      
+      socket.prependListener('close', (hadError) => {
+        if (hadError) {
+          debugLog(`Socket closed with error for ${requestId}`);
+        }
+      });
+    }
   });
   
   // Handle request abort/destroy
@@ -580,7 +586,8 @@ function logRequest(protocol, options, req, url) {
     if (!logEntry.response) {
       logEntry.response = {
         timestamp: new Date().toISOString(),
-        error: 'Request aborted'
+        error: 'Request aborted - this may be due to Claude CLI timeout during compaction or other long operations',
+        abortReason: 'Client cancelled request'
       };
       if (jsonLinesLogger) {
         jsonLinesLogger.log(logEntry).catch(err => {
