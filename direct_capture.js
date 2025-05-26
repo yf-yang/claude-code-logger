@@ -201,7 +201,7 @@ function logRequest(protocol, options, req, url) {
   requestCounter++;
   const requestId = `req-${Date.now()}-${requestCounter}`;
   debugLog(`Found Claude API request #${requestCounter} (ID: ${requestId}) to: ${url}`);
-  debugLog(`Total API logs in memory: ${apiLogs.length}`);
+  debugLog(`Logging API request #${requestCounter}`);
 
   // Get current datetime for the log entry
   const timestamp = new Date().toISOString();
@@ -309,6 +309,25 @@ function logRequest(protocol, options, req, url) {
     let responseTimeout = null;
     let isStreamingResponse = false;
     let streamingLogWritten = false;
+    
+    // Handle response stream errors
+    res.on('error', (error) => {
+      debugLog(`Response stream error for ${requestId}: ${error.message}`);
+      responseData.error = `Response error: ${error.message}`;
+      
+      // Clear timeout on error
+      if (responseTimeout) {
+        clearTimeout(responseTimeout);
+      }
+      
+      // Log the error if not already logged
+      if (!streamingLogWritten && jsonLinesLogger) {
+        logEntry.response = responseData;
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging response error:', err);
+        });
+      }
+    });
     
     // Check if this is a streaming response
     if (res.headers["content-type"] && res.headers["content-type"].includes("text/event-stream")) {
@@ -533,6 +552,59 @@ function logRequest(protocol, options, req, url) {
       });
     }
   });
+  
+  // Handle socket errors to prevent crashes
+  req.on('socket', (socket) => {
+    // Remove any existing error listeners to prevent duplicates
+    socket.removeAllListeners('error');
+    socket.removeAllListeners('close');
+    
+    socket.on('error', (error) => {
+      debugLog(`Socket error for ${requestId}: ${error.message}`);
+      // Don't let socket errors bubble up and crash the process
+      if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+        debugLog(`Socket closed unexpectedly for ${requestId}`);
+      }
+    });
+    
+    socket.on('close', (hadError) => {
+      if (hadError) {
+        debugLog(`Socket closed with error for ${requestId}`);
+      }
+    });
+  });
+  
+  // Handle request abort/destroy
+  req.on('abort', () => {
+    debugLog(`Request aborted for ${requestId}`);
+    if (!logEntry.response) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: 'Request aborted'
+      };
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging aborted request:', err);
+        });
+      }
+    }
+  });
+  
+  req.on('close', () => {
+    debugLog(`Request closed for ${requestId}`);
+    // If request closed without response, log it
+    if (!logEntry.response && !req._headerSent) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: 'Request closed without response'
+      };
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging closed request:', err);
+        });
+      }
+    }
+  });
 }
 
 // Track which logs have been written to file
@@ -743,6 +815,58 @@ function setupSignalHandlers() {
 
 // Set up signal handlers
 setupSignalHandlers();
+
+// Set up global error handlers to prevent crashes from network errors
+process.on('uncaughtException', (error) => {
+  // Check if this is a network-related error we can safely ignore
+  const isNetworkError = 
+    error.code === 'ECONNRESET' || 
+    error.code === 'EPIPE' || 
+    error.code === 'ENOTFOUND' ||
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNREFUSED' ||
+    (error.message && (
+      error.message.includes('socket hang up') ||
+      error.message.includes('read ECONNRESET') ||
+      error.message.includes('write EPIPE')
+    ));
+    
+  if (isNetworkError) {
+    console.error('Network error in claude-logger (continuing):', error.message);
+    debugLog(`Network error caught at process level: ${error.code || error.message}`);
+    // Don't crash on network errors - these are expected in networked applications
+  } else {
+    // Log and re-emit non-network errors
+    console.error('Uncaught exception in claude-logger:', error);
+    // Remove our handler and re-emit to let the process handle it
+    process.removeAllListeners('uncaughtException');
+    process.emit('uncaughtException', error);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  // Similar handling for promise rejections
+  const isNetworkError = reason && (
+    reason.code === 'ECONNRESET' || 
+    reason.code === 'EPIPE' || 
+    reason.code === 'ENOTFOUND' ||
+    reason.code === 'ETIMEDOUT' ||
+    reason.code === 'ECONNREFUSED' ||
+    (reason.message && (
+      reason.message.includes('socket hang up') ||
+      reason.message.includes('read ECONNRESET') ||
+      reason.message.includes('write EPIPE')
+    ))
+  );
+  
+  if (isNetworkError) {
+    console.error('Network error in promise (continuing):', reason.message || reason);
+    debugLog('Network error caught in promise rejection');
+  } else {
+    // Log but don't re-throw promise rejections
+    console.error('Unhandled rejection in claude-logger:', reason);
+  }
+});
 
 // Log when module is loaded
 debugLog("Direct capture module loaded");
