@@ -82,6 +82,9 @@ function debugLog(message) {
 const originalHttpRequest = http.request;
 const originalHttpsRequest = https.request;
 
+// Store original fetch if it exists
+const originalFetch = global.fetch;
+
 // Patch the http.request method
 http.request = function () {
   debugLog("http.request intercepted");
@@ -447,10 +450,161 @@ function setupSignalHandlers() {
 // Set up signal handlers
 setupSignalHandlers();
 
+// Log when module is loaded
+debugLog("Direct capture module loaded");
+debugLog(`Process PID: ${process.pid}`);
+debugLog(`Parent PID: ${process.ppid}`);
+debugLog(`Log file: ${logFile}`);
+debugLog(`Process title: ${process.title}`);
+debugLog(`Exec path: ${process.execPath}`);
+
 // If running directly and not as a module
 if (require.main === module) {
   debugLog("Direct capture module loaded, HTTP/HTTPS interception active");
   console.log(`Claude API Logger v${version} started - capturing requests to anthropic.com`);
+} else {
+  debugLog("Module loaded via require()");
+}
+
+// Patch fetch if it exists
+if (typeof global.fetch === 'function') {
+  debugLog("Patching global.fetch");
+  
+  global.fetch = async function(url, options = {}) {
+    const urlString = typeof url === 'string' ? url : url.toString();
+    
+    debugLog(`Intercepted fetch request to: ${urlString}`);
+    
+    // Check if this is a Claude API request
+    if (urlString.includes('anthropic.com')) {
+      requestCounter++;
+      const requestId = `req-${Date.now()}-${requestCounter}`;
+      debugLog(`Found Claude API fetch request #${requestCounter} (ID: ${requestId}) to: ${urlString}`);
+      
+      const timestamp = new Date().toISOString();
+      
+      // Create log entry
+      const logEntry = {
+        requestId: requestId,
+        request: {
+          timestamp: timestamp,
+          protocol: 'fetch',
+          url: urlString,
+          method: (options.method || 'GET').toUpperCase(),
+          headers: options.headers || {}
+        },
+        response: null,
+        project: {
+          name: projectName,
+          timestamp: timestamp,
+          version: version
+        }
+      };
+      
+      // Redact authorization header
+      if (logEntry.request.headers['authorization']) {
+        logEntry.request.headers['authorization'] = '[REDACTED]';
+      }
+      if (logEntry.request.headers['Authorization']) {
+        logEntry.request.headers['Authorization'] = '[REDACTED]';
+      }
+      
+      // Add body if present
+      if (options.body) {
+        try {
+          logEntry.request.body = typeof options.body === 'string' ? 
+            JSON.parse(options.body) : options.body;
+        } catch (e) {
+          logEntry.request.body = options.body;
+        }
+      }
+      
+      apiLogs.push(logEntry);
+      
+      try {
+        // Call original fetch
+        const response = await originalFetch(url, options);
+        
+        // Clone response to read it without consuming
+        const responseClone = response.clone();
+        
+        // Log response
+        const responseData = {
+          timestamp: new Date().toISOString(),
+          statusCode: response.status,
+          headers: {}
+        };
+        
+        // Copy headers
+        response.headers.forEach((value, key) => {
+          responseData.headers[key] = value;
+        });
+        
+        try {
+          const responseBody = await responseClone.text();
+          const contentType = response.headers.get('content-type');
+          
+          if (contentType && contentType.includes('application/json')) {
+            try {
+              const parsedBody = JSON.parse(responseBody);
+              
+              // Redact sensitive information
+              if (parsedBody.user_id) parsedBody.user_id = "[REDACTED]";
+              if (parsedBody.account) {
+                if (parsedBody.account.uuid) parsedBody.account.uuid = "[REDACTED]";
+                if (parsedBody.account.email) parsedBody.account.email = "[EMAIL_REDACTED]";
+                if (parsedBody.account.full_name) parsedBody.account.full_name = "[REDACTED]";
+              }
+              if (parsedBody.organization) {
+                if (parsedBody.organization.uuid) parsedBody.organization.uuid = "[REDACTED]";
+                if (parsedBody.organization.name) parsedBody.organization.name = "[REDACTED]";
+              }
+              
+              responseData.body = parsedBody;
+            } catch (e) {
+              responseData.body = redactSensitiveInfo(responseBody);
+            }
+          } else if (contentType && contentType.includes('text/event-stream')) {
+            // Handle SSE responses
+            responseData.body = responseBody;
+            responseData.streaming = true;
+          } else {
+            responseData.body = redactSensitiveInfo(responseBody);
+          }
+        } catch (e) {
+          responseData.bodyError = 'Error reading response body: ' + e.message;
+        }
+        
+        logEntry.response = responseData;
+        
+        // Trigger immediate write
+        debugLog(`Fetch response complete for request ${requestId}`);
+        setImmediate(() => {
+          writeLogsToFile();
+        });
+        
+        return response;
+      } catch (error) {
+        // Log error
+        logEntry.response = {
+          timestamp: new Date().toISOString(),
+          error: error.message
+        };
+        
+        // Trigger write on error
+        setImmediate(() => {
+          writeLogsToFile();
+        });
+        
+        throw error;
+      }
+    }
+    
+    // For non-Claude requests, just pass through
+    return originalFetch(url, options);
+  };
+} else {
+  debugLog("No global.fetch found, skipping fetch patching");
 }
 
 /**
