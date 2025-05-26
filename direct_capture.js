@@ -254,7 +254,12 @@ function logRequest(protocol, options, req, url) {
       let responseBody = "";
       try {
         const buffer = Buffer.concat(responseChunks);
-        if (res.headers["content-encoding"] === "gzip") {
+        
+        // Check for compression by content-encoding header or by detecting magic bytes
+        const isGzip = res.headers["content-encoding"] === "gzip" || 
+                      (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b);
+        
+        if (isGzip) {
           responseBody = zlib.gunzipSync(buffer).toString();
         } else if (res.headers["content-encoding"] === "br") {
           responseBody = zlib.brotliDecompressSync(buffer).toString();
