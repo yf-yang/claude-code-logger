@@ -16,6 +16,7 @@ const { spawn } = require("child_process");
 const crypto = require("crypto");
 const os = require("os");
 const { execSync } = require("child_process");
+const JsonLinesLogger = require("./jsonl_logger");
 
 // Get version from package.json
 const packageJson = require("./package.json");
@@ -108,17 +109,14 @@ if (!fs.existsSync(projectLogsDir)) {
 }
 
 // Create log file with consistent naming across the session
-const logFile = path.join(projectLogsDir, `${projectName}_${sessionId}.json`);
+const logFile = path.join(projectLogsDir, `${projectName}_${sessionId}.jsonl`);
 
 // Check if this is the first time we're accessing this log file
 const isNewLogFile = !fs.existsSync(logFile);
 
 // Create or append to the log file
 try {
-  // Initialize file if it doesn't exist yet
-  if (isNewLogFile) {
-    fs.writeFileSync(logFile, "[]");
-  }
+  // No need to initialize JSON Lines files - they start empty
   
   // Position the help message adjacent to user-facing logs by appending to existing log files
   if (showHelpMessage && !isNewLogFile) {

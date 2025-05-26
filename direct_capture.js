@@ -11,6 +11,7 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
+const JsonLinesLogger = require("./jsonl_logger");
 
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
@@ -18,8 +19,15 @@ const projectName = process.env.CLAUDE_PROJECT_NAME || "project";
 const debugMode = process.env.CLAUDE_DEBUG === "true";
 const version = process.env.CLAUDE_LOGGER_VERSION || "unknown";
 
-// In-memory store for accumulating logs
-const apiLogs = [];
+// Initialize JSON Lines logger
+let jsonLinesLogger = null;
+if (logFile) {
+  // Log file should already have .jsonl extension from claude_logger.js
+  jsonLinesLogger = new JsonLinesLogger(logFile, {
+    maxQueueSize: 10,  // Smaller queue for more frequent writes
+    flushInterval: 2000
+  });
+}
 
 // Log startup with version information
 debugLog(`Claude Logger v${version} started`);
@@ -220,7 +228,7 @@ function logRequest(protocol, options, req, url) {
     version: version
   };
   
-  apiLogs.push(logEntry);
+  // Don't log yet - wait for response
 
   // Add method and headers if available (with sensitive data redacted)
   if (typeof options === "object") {
@@ -313,11 +321,13 @@ function logRequest(protocol, options, req, url) {
       logEntry.response = responseData;
       
       // Write the initial request/response pair immediately for streaming
-      setImmediate(() => {
-        debugLog(`Writing initial log for streaming request ${req._logRequestId}`);
-        writeLogsToFile();
-        streamingLogWritten = true;
-      });
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging streaming request:', err);
+        });
+      }
+      streamingLogWritten = true;
+      debugLog(`Logged streaming request ${req._logRequestId}`);
     }
     
     // Set a timeout for response collection
@@ -333,10 +343,12 @@ function logRequest(protocol, options, req, url) {
       // Don't overwrite if already written for streaming
       if (!streamingLogWritten) {
         logEntry.response = responseData;
-        // Trigger write for timeout
-        setImmediate(() => {
-          writeLogsToFile();
-        });
+        // Log the timeout response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging timeout request:', err);
+          });
+        }
       }
     }, timeoutDuration);
     
@@ -454,14 +466,16 @@ function logRequest(protocol, options, req, url) {
       if (!streamingLogWritten) {
         logEntry.response = responseData;
         
-        // Trigger immediate write for completed request/response pairs
+        // Log the complete request/response pair
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging request:', err);
+          });
+        }
+        
         const reqId = req._logRequestId || 'unknown';
         debugLog(`Response complete for request ${reqId}`);
         debugLog(`Response had ${responseChunks.length} chunks, total size: ${Buffer.concat(responseChunks).length} bytes`);
-        debugLog(`Current apiLogs length: ${apiLogs.length}, lastWrittenLogIndex: ${lastWrittenLogIndex}`);
-        setImmediate(() => {
-          writeLogsToFile();
-        });
       } else {
         debugLog(`Streaming response ended for request ${req._logRequestId}, already logged`);
       }
@@ -477,15 +491,24 @@ function logRequest(protocol, options, req, url) {
       if (!streamingLogWritten) {
         logEntry.response = responseData;
         
+        // Log the complete request/response pair (even with error)
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging request:', err);
+          });
+        }
+        
         // Clear timeout on error
         if (responseTimeout) {
           clearTimeout(responseTimeout);
         }
         
-        // Trigger write on error
-        setImmediate(() => {
-          writeLogsToFile();
-        });
+        // Log the error response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging error response:', err);
+          });
+        }
       }
     });
   });
@@ -503,10 +526,12 @@ function logRequest(protocol, options, req, url) {
       };
     }
     
-    // Trigger write on error
-    setImmediate(() => {
-      writeLogsToFile();
-    });
+    // Log the connection error
+    if (jsonLinesLogger && req._logEntry) {
+      jsonLinesLogger.log(req._logEntry).catch(err => {
+        console.error('Error logging connection error:', err);
+      });
+    }
   });
 }
 
@@ -673,22 +698,7 @@ function writeLogsToFile(forceWrite = false) {
   }
 }
 
-// Set up a periodic log writing interval (every 2 seconds for more responsive logging)
-const logInterval = setInterval(() => {
-  if (apiLogs.length > lastWrittenLogIndex + 1) {
-    debugLog(`Periodic write check: ${apiLogs.length - lastWrittenLogIndex - 1} new logs to write`);
-    writeLogsToFile();
-  }
-}, 2000);
-
-// Also force write if we accumulate too many logs in memory
-const memoryCheckInterval = setInterval(() => {
-  const unwrittenLogs = apiLogs.length - lastWrittenLogIndex - 1;
-  if (unwrittenLogs >= MAX_LOGS_IN_MEMORY) {
-    debugLog(`Force writing ${unwrittenLogs} logs due to memory limit`);
-    writeLogsToFile();
-  }
-}, 500);
+// JSON Lines logger handles its own periodic flushing and memory management
 
 /**
  * Set up process signal handlers to ensure logs are written before exit
@@ -696,56 +706,21 @@ const memoryCheckInterval = setInterval(() => {
 function setupSignalHandlers() {
   // Handle normal exit
   process.on("exit", () => {
-    clearInterval(logInterval);
-    clearInterval(memoryCheckInterval);
-    // Synchronously write any remaining logs (including those that might be in the queue)
-    const remainingLogs = apiLogs.length - lastWrittenLogIndex - 1;
-    if (remainingLogs > 0) {
-      debugLog(`Writing ${remainingLogs} remaining logs on exit (including incomplete ones)...`);
-      // Use synchronous file operations for exit handler
-      try {
-        const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
-        let allLogs = [];
-        if (fs.existsSync(logFile)) {
-          const content = fs.readFileSync(logFile, 'utf8');
-          if (content && content.trim() !== '[]') {
-            allLogs = JSON.parse(content);
-          }
-        }
-        allLogs = allLogs.concat(newLogs);
-        fs.writeFileSync(logFile, JSON.stringify(allLogs, null, 2));
-        debugLog(`Synchronously wrote ${newLogs.length} logs on exit`);
-      } catch (err) {
-        console.error(`Failed to write logs on exit: ${err.message}`);
-      }
+    // JSON Lines logger will handle flushing on exit
+    if (jsonLinesLogger) {
+      jsonLinesLogger.close();
     }
-    debugLog(`Claude logger exiting gracefully (${writeQueue.length} queued writes discarded)`);
+    debugLog(`Claude logger exiting gracefully`);
   });
 
   // Handle termination signals
   const handleSignal = (signal) => {
     return () => {
       debugLog(`Capture process received ${signal}, flushing logs and exiting`);
-      clearInterval(logInterval);
-      clearInterval(memoryCheckInterval);
       
-      // Try to write logs before exiting
-      if (apiLogs.length > lastWrittenLogIndex + 1) {
-        try {
-          const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
-          let allLogs = [];
-          if (fs.existsSync(logFile)) {
-            const content = fs.readFileSync(logFile, 'utf8');
-            if (content && content.trim() !== '[]') {
-              allLogs = JSON.parse(content);
-            }
-          }
-          allLogs = allLogs.concat(newLogs);
-          fs.writeFileSync(logFile, JSON.stringify(allLogs, null, 2));
-          console.log(`Flushed ${newLogs.length} logs before exit`);
-        } catch (err) {
-          console.error(`Failed to flush logs: ${err.message}`);
-        }
+      // JSON Lines logger will handle flushing
+      if (jsonLinesLogger) {
+        jsonLinesLogger.close();
       }
       
       process.exit(0);  // Exit with success code
@@ -838,7 +813,7 @@ if (typeof global.fetch === 'function') {
         }
       }
       
-      apiLogs.push(logEntry);
+      // Don't log yet - wait for response
       
       try {
         // Call original fetch
@@ -896,11 +871,13 @@ if (typeof global.fetch === 'function') {
         
         logEntry.response = responseData;
         
-        // Trigger immediate write
+        // Log the complete request/response pair
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging fetch request:', err);
+          });
+        }
         debugLog(`Fetch response complete for request ${requestId}`);
-        setImmediate(() => {
-          writeLogsToFile();
-        });
         
         return response;
       } catch (error) {
@@ -910,10 +887,12 @@ if (typeof global.fetch === 'function') {
           error: error.message
         };
         
-        // Trigger write on error
-        setImmediate(() => {
-          writeLogsToFile();
-        });
+        // Log the error response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging fetch error:', err);
+          });
+        }
         
         throw error;
       }
@@ -931,11 +910,10 @@ if (typeof global.fetch === 'function') {
  * @module claude-logger/direct-capture
  */
 module.exports = {
-  // Expose the log data structure - can be used by parent module
-  apiLogs,
+  // Expose the JSON Lines logger
+  jsonLinesLogger,
   
   // Core functions
-  writeLogsToFile,
   redactSensitiveInfo,
   
   // Log file paths
