@@ -11,6 +11,7 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
+const JsonLinesLogger = require("./jsonl_logger");
 
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
@@ -18,8 +19,15 @@ const projectName = process.env.CLAUDE_PROJECT_NAME || "project";
 const debugMode = process.env.CLAUDE_DEBUG === "true";
 const version = process.env.CLAUDE_LOGGER_VERSION || "unknown";
 
-// In-memory store for accumulating logs
-const apiLogs = [];
+// Initialize JSON Lines logger
+let jsonLinesLogger = null;
+if (logFile) {
+  // Log file should already have .jsonl extension from claude_logger.js
+  jsonLinesLogger = new JsonLinesLogger(logFile, {
+    maxQueueSize: 10,  // Smaller queue for more frequent writes
+    flushInterval: 2000
+  });
+}
 
 // Log startup with version information
 debugLog(`Claude Logger v${version} started`);
@@ -82,6 +90,17 @@ function debugLog(message) {
 const originalHttpRequest = http.request;
 const originalHttpsRequest = https.request;
 
+debugLog("Patching http/https request methods");
+
+// Counter for tracking requests
+let requestCounter = 0;
+
+// Store original fetch if it exists
+const originalFetch = global.fetch;
+
+// Track active connections for debugging
+const activeConnections = new Map();
+
 // Patch the http.request method
 http.request = function () {
   debugLog("http.request intercepted");
@@ -99,6 +118,18 @@ http.request = function () {
 
   // Call original and capture request object
   const req = originalHttpRequest.apply(this, arguments);
+
+  // Track connection reuse
+  if (req.socket) {
+    const socketKey = `${req.socket.localAddress}:${req.socket.localPort}->${req.socket.remoteAddress}:${req.socket.remotePort}`;
+    if (activeConnections.has(socketKey)) {
+      debugLog(`Reusing existing connection: ${socketKey}`);
+      activeConnections.set(socketKey, activeConnections.get(socketKey) + 1);
+    } else {
+      debugLog(`New connection established: ${socketKey}`);
+      activeConnections.set(socketKey, 1);
+    }
+  }
 
   // Log request details
   logRequest("http", options, req, url);
@@ -121,8 +152,23 @@ https.request = function () {
     url = `https://${options.hostname || options.host}${options.path || "/"}`;
   }
 
+  debugLog(`Request details - URL: ${url}, Method: ${options.method || 'GET'}`);
+
   // Call original and capture request object
   const req = originalHttpsRequest.apply(this, arguments);
+
+  // Track connection reuse for HTTPS
+  req.on('socket', (socket) => {
+    const socketKey = `${socket.localAddress || 'unknown'}:${socket.localPort || 'unknown'}->${socket.remoteAddress || options.hostname}:${socket.remotePort || options.port || 443}`;
+    if (activeConnections.has(socketKey)) {
+      const count = activeConnections.get(socketKey) + 1;
+      debugLog(`HTTPS: Reusing existing connection: ${socketKey} (request #${count})`);
+      activeConnections.set(socketKey, count);
+    } else {
+      debugLog(`HTTPS: New connection established: ${socketKey}`);
+      activeConnections.set(socketKey, 1);
+    }
+  });
 
   // Log request details
   logRequest("https", options, req, url);
@@ -143,18 +189,26 @@ function redactSensitiveInfo(str) {
 
 // Log a request and its response
 function logRequest(protocol, options, req, url) {
+  // Log all requests for debugging
+  debugLog(`Intercepted ${protocol} request to: ${url}`);
+  
   // Skip non-Claude API requests
   if (!url.includes("anthropic.com")) {
+    debugLog(`Skipping non-Claude request: ${url}`);
     return;
   }
 
-  debugLog(`Found Claude API request to: ${url}`);
+  requestCounter++;
+  const requestId = `req-${Date.now()}-${requestCounter}`;
+  debugLog(`Found Claude API request #${requestCounter} (ID: ${requestId}) to: ${url}`);
+  debugLog(`Logging API request #${requestCounter}`);
 
   // Get current datetime for the log entry
   const timestamp = new Date().toISOString();
   
   // Create log data object with request/response structure
   const logEntry = {
+    requestId: requestId,
     request: {
       timestamp: timestamp,
       protocol: protocol,
@@ -163,6 +217,10 @@ function logRequest(protocol, options, req, url) {
     response: null, // Will be populated when response is received
   };
   
+  // Store requestId on the request object for later reference
+  req._logRequestId = requestId;
+  req._logEntry = logEntry;
+  
   // Add project metadata
   logEntry.project = {
     name: projectName,
@@ -170,22 +228,30 @@ function logRequest(protocol, options, req, url) {
     version: version
   };
   
-  apiLogs.push(logEntry);
+  // Don't log yet - wait for response
 
   // Add method and headers if available (with sensitive data redacted)
   if (typeof options === "object") {
     logEntry.request.method = options.method || "GET";
 
-    // Deep copy and redact headers
+    // Copy headers (avoid deep copy which might fail on non-plain objects)
     if (options.headers) {
-      logEntry.request.headers = JSON.parse(JSON.stringify(options.headers));
-
-      // Explicitly redact sensitive headers
-      if (logEntry.request.headers["x-api-key"]) {
-        logEntry.request.headers["x-api-key"] = "[REDACTED]";
-      }
-      if (logEntry.request.headers["authorization"]) {
-        logEntry.request.headers["authorization"] = "[REDACTED]";
+      logEntry.request.headers = {};
+      try {
+        // Copy headers safely
+        for (const key in options.headers) {
+          if (options.headers.hasOwnProperty(key)) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === "x-api-key" || lowerKey === "authorization") {
+              logEntry.request.headers[key] = "[REDACTED]";
+            } else {
+              logEntry.request.headers[key] = String(options.headers[key]);
+            }
+          }
+        }
+      } catch (e) {
+        debugLog(`Error copying headers: ${e.message}`);
+        logEntry.request.headers = { error: "Failed to copy headers" };
       }
     } else {
       logEntry.request.headers = {};
@@ -198,12 +264,18 @@ function logRequest(protocol, options, req, url) {
   let requestBody = [];
 
   req.write = function (chunk) {
-    if (chunk) requestBody.push(chunk);
+    if (chunk) {
+      // Ensure chunk is a Buffer
+      requestBody.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
     return originalWrite.apply(this, arguments);
   };
 
   req.end = function (chunk) {
-    if (chunk) requestBody.push(chunk);
+    if (chunk) {
+      // Ensure chunk is a Buffer
+      requestBody.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
 
     // Add body to log data if we captured any
     if (requestBody.length > 0) {
@@ -242,16 +314,99 @@ function logRequest(protocol, options, req, url) {
 
     // Collect response body chunks
     const responseChunks = [];
+    let responseTimeout = null;
+    let isStreamingResponse = false;
+    let streamingLogWritten = false;
+    
+    // Handle response stream errors
+    res.on('error', (error) => {
+      debugLog(`Response stream error for ${requestId}: ${error.message}`);
+      responseData.error = `Response error: ${error.message}`;
+      
+      // Clear timeout on error
+      if (responseTimeout) {
+        clearTimeout(responseTimeout);
+      }
+      
+      // Log the error if not already logged
+      if (!streamingLogWritten && jsonLinesLogger) {
+        logEntry.response = responseData;
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging response error:', err);
+        });
+      }
+    });
+    
+    // Check if this is a streaming response
+    if (res.headers["content-type"] && res.headers["content-type"].includes("text/event-stream")) {
+      isStreamingResponse = true;
+      debugLog("Detected streaming (SSE) response");
+      
+      // For streaming responses, log the request immediately with a placeholder response
+      responseData.streaming = true;
+      responseData.streamStarted = new Date().toISOString();
+      logEntry.response = responseData;
+      
+      // Write the initial request/response pair immediately for streaming
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging streaming request:', err);
+        });
+      }
+      streamingLogWritten = true;
+      debugLog(`Logged streaming request ${req._logRequestId}`);
+    }
+    
+    // Set a timeout for response collection
+    // Use longer timeout for streaming responses (5 minutes vs 30 seconds)
+    const timeoutDuration = isStreamingResponse ? 300000 : 30000;
+    responseTimeout = setTimeout(() => {
+      debugLog(`Response timeout reached after ${timeoutDuration/1000}s, logging partial response`);
+      responseData.timeout = true;
+      responseData.partialBody = responseChunks.length > 0 ? 
+        `Partial response collected (${responseChunks.length} chunks, ${Buffer.concat(responseChunks).length} bytes)` : 
+        "No response data collected";
+      
+      // Don't overwrite if already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        // Log the timeout response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging timeout request:', err);
+          });
+        }
+      }
+    }, timeoutDuration);
+    
+    // Important: Set up data handler immediately to ensure stream flows
+    // and doesn't cause backpressure that could lead to timeouts
     res.on("data", (chunk) => {
       responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      debugLog(`Response chunk received: ${chunk.length} bytes`);
+      
+      // For very large responses (>10MB), consider dropping old chunks to prevent memory issues
+      const totalSize = responseChunks.reduce((sum, c) => sum + c.length, 0);
+      if (totalSize > 10 * 1024 * 1024) { // 10MB limit
+        debugLog(`Warning: Large response detected (${totalSize} bytes), may impact performance`);
+      }
     });
 
     // Process complete response
     res.on("end", () => {
+      // Clear timeout since response completed
+      if (responseTimeout) {
+        clearTimeout(responseTimeout);
+      }
       let responseBody = "";
       try {
         const buffer = Buffer.concat(responseChunks);
-        if (res.headers["content-encoding"] === "gzip") {
+        
+        // Check for compression by content-encoding header or by detecting magic bytes
+        const isGzip = res.headers["content-encoding"] === "gzip" || 
+                      (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b);
+        
+        if (isGzip) {
           responseBody = zlib.gunzipSync(buffer).toString();
         } else if (res.headers["content-encoding"] === "br") {
           responseBody = zlib.brotliDecompressSync(buffer).toString();
@@ -262,7 +417,18 @@ function logRequest(protocol, options, req, url) {
         }
       } catch (e) {
         responseData.bodyError = "Error processing response body: " + e.message;
-        logEntry.response = responseData;
+        
+        // Only update and write if not already written for streaming
+        if (!streamingLogWritten) {
+          logEntry.response = responseData;
+          
+          // Log the error response
+          if (jsonLinesLogger) {
+            jsonLinesLogger.log(logEntry).catch(err => {
+              console.error('Error logging response error:', err);
+            });
+          }
+        }
         return;
       }
 
@@ -270,6 +436,7 @@ function logRequest(protocol, options, req, url) {
         res.headers["content-type"] &&
         res.headers["content-type"].includes("text/event-stream")
       ) {
+        debugLog(`Processing SSE response, total size: ${responseBody.length} bytes`);
         // Parse SSE responses
         try {
           responseData.events = responseBody
@@ -310,104 +477,170 @@ function logRequest(protocol, options, req, url) {
           if (parsedBody.user_id) {
             parsedBody.user_id = "[REDACTED]";
           }
+          
+          // Redact account information
+          if (parsedBody.account) {
+            if (parsedBody.account.uuid) parsedBody.account.uuid = "[REDACTED]";
+            if (parsedBody.account.email) parsedBody.account.email = "[EMAIL_REDACTED]";
+            if (parsedBody.account.full_name) parsedBody.account.full_name = "[REDACTED]";
+          }
+          
+          // Redact organization information
+          if (parsedBody.organization) {
+            if (parsedBody.organization.uuid) parsedBody.organization.uuid = "[REDACTED]";
+            if (parsedBody.organization.name) parsedBody.organization.name = "[REDACTED]";
+          }
 
-          responseData.parsedBody = parsedBody;
+          responseData.body = parsedBody;
         } catch (e) {
           // If not JSON, store the body (with sensitive data redacted)
           responseData.body = redactSensitiveInfo(responseBody);
         }
       }
 
-      logEntry.response = responseData;
+      // Only update response if not already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        
+        // Log the complete request/response pair
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging request:', err);
+          });
+        }
+        
+        const reqId = req._logRequestId || 'unknown';
+        debugLog(`Response complete for request ${reqId}`);
+        debugLog(`Response had ${responseChunks.length} chunks, total size: ${Buffer.concat(responseChunks).length} bytes`);
+      } else {
+        debugLog(`Streaming response ended for request ${req._logRequestId}, already logged`);
+      }
     });
+    
+    // Also track response errors
+    res.on("error", (error) => {
+      const reqId = req._logRequestId || 'unknown';
+      debugLog(`Response error for request ${reqId}: ${error.message}`);
+      responseData.error = error.message;
+      
+      // Only update and write if not already written for streaming
+      if (!streamingLogWritten) {
+        logEntry.response = responseData;
+        
+        // Log the complete request/response pair (even with error)
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging request:', err);
+          });
+        }
+        
+        // Clear timeout on error
+        if (responseTimeout) {
+          clearTimeout(responseTimeout);
+        }
+        
+        // Log the error response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging error response:', err);
+          });
+        }
+      }
+    });
+  });
+  
+  // Track request errors
+  req.on("error", (error) => {
+    debugLog(`Request error for ${requestId}: ${error.message}`);
+    logEntry.request.error = error.message;
+    
+    // Check if this is an abort-related error
+    if (error.code === 'ECONNRESET' && error.message.includes('aborted')) {
+      debugLog(`Request aborted via ECONNRESET for ${requestId}`);
+    }
+    
+    // Create minimal response entry for failed requests
+    if (!logEntry.response) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: `Request failed: ${error.message}`
+      };
+    }
+    
+    // Log the connection error
+    if (jsonLinesLogger && req._logEntry) {
+      jsonLinesLogger.log(req._logEntry).catch(err => {
+        console.error('Error logging connection error:', err);
+      });
+    }
+  });
+  
+  // Handle socket errors to prevent crashes
+  req.on('socket', (socket) => {
+    // Store original listeners count to avoid interfering with existing handlers
+    const originalErrorListenerCount = socket.listenerCount('error');
+    const originalCloseListenerCount = socket.listenerCount('close');
+    
+    // Only add our listeners if we haven't already
+    if (!socket._loggerListenersAdded) {
+      socket._loggerListenersAdded = true;
+      
+      // Add our error handler without removing existing ones
+      socket.prependListener('error', (error) => {
+        debugLog(`Socket error for ${requestId}: ${error.message}`);
+        // Log but don't prevent other handlers from running
+        if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+          debugLog(`Socket closed unexpectedly for ${requestId}`);
+        }
+      });
+      
+      socket.prependListener('close', (hadError) => {
+        if (hadError) {
+          debugLog(`Socket closed with error for ${requestId}`);
+        }
+      });
+    }
+  });
+  
+  // Handle request abort/destroy
+  // Note: 'abort' event is deprecated in newer Node versions, but we'll handle both for compatibility
+  const handleAbort = (reason) => {
+    debugLog(`Request aborted for ${requestId}: ${reason}`);
+    if (!logEntry.response) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: 'Request aborted - this may be due to Claude CLI timeout during compaction or other long operations',
+        abortReason: reason || 'Client cancelled request'
+      };
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging aborted request:', err);
+        });
+      }
+    }
+  };
+  
+  req.on('abort', () => handleAbort('abort event'));
+  
+  req.on('close', () => {
+    debugLog(`Request closed for ${requestId}`);
+    // If request closed without response, log it
+    if (!logEntry.response && !req._headerSent) {
+      logEntry.response = {
+        timestamp: new Date().toISOString(),
+        error: 'Request closed without response'
+      };
+      if (jsonLinesLogger) {
+        jsonLinesLogger.log(logEntry).catch(err => {
+          console.error('Error logging closed request:', err);
+        });
+      }
+    }
   });
 }
 
-// Track which logs have been written to file
-let lastWrittenLogIndex = -1;
 
-
-/**
- * Writes accumulated logs to the log file
- * Handles errors gracefully and creates backups when necessary
- * @returns {boolean} - True if logs were written successfully, false otherwise
- */
-function writeLogsToFile() {
-  // Exit early if there are no new logs to write
-  if (apiLogs.length === 0 || lastWrittenLogIndex === apiLogs.length - 1) {
-    debugLog("No new Claude API requests to write.");
-    return true;
-  }
-
-  debugLog(`Writing logs: ${lastWrittenLogIndex + 1} to ${apiLogs.length - 1}`);
-
-  try {
-    // Get only the logs that haven't been written yet
-    const newLogs = apiLogs.slice(lastWrittenLogIndex + 1);
-    
-    // Ensure parent directory exists
-    const logFileDir = require('path').dirname(logFile);
-    if (!fs.existsSync(logFileDir)) {
-      fs.mkdirSync(logFileDir, { recursive: true });
-      debugLog(`Created log directory: ${logFileDir}`);
-    }
-    
-    // Read and parse existing logs if the file exists
-    let allLogs = [];
-    if (fs.existsSync(logFile)) {
-      try {
-        const content = fs.readFileSync(logFile, 'utf8');
-        if (content && content.trim() !== '[]') {
-          allLogs = JSON.parse(content);
-          // Validate that we have an array
-          if (!Array.isArray(allLogs)) {
-            throw new Error("Existing log file does not contain a valid array");
-          }
-        }
-      } catch (parseErr) {
-        debugLog(`Error parsing existing log file: ${parseErr.message}`);
-        
-        // Create a backup of the original file instead of overwriting
-        const backupFile = `${logFile}.backup-${Date.now()}`;
-        try {
-          fs.copyFileSync(logFile, backupFile);
-          debugLog(`Backed up original log file to: ${backupFile}`);
-        } catch (backupErr) {
-          console.error(`Failed to create backup of corrupted log file: ${backupErr.message}`);
-        }
-        
-        // Start fresh with an empty array
-        allLogs = [];
-      }
-    }
-
-    // Combine existing logs with new logs
-    allLogs = allLogs.concat(newLogs);
-    
-    // Format logs as JSON
-    const logsContent = JSON.stringify(allLogs, null, 2);
-    
-    // Save to log file (write to temp file first, then rename for atomicity)
-    const tempLogFile = `${logFile}.temp-${Date.now()}`;
-    fs.writeFileSync(tempLogFile, logsContent);
-    fs.renameSync(tempLogFile, logFile);
-    debugLog(`API logs saved to: ${logFile}`);
-    
-    // Update the last written index
-    lastWrittenLogIndex = apiLogs.length - 1;
-    return true;
-  } catch (err) {
-    console.error(`Error writing logs: ${err.message}`);
-    return false;
-  }
-}
-
-// Set up a periodic log writing interval (every 5 seconds)
-const logInterval = setInterval(() => {
-  if (apiLogs.length > 0) {
-    writeLogsToFile();
-  }
-}, 5000);
+// JSON Lines logger handles its own periodic flushing and memory management
 
 /**
  * Set up process signal handlers to ensure logs are written before exit
@@ -415,17 +648,23 @@ const logInterval = setInterval(() => {
 function setupSignalHandlers() {
   // Handle normal exit
   process.on("exit", () => {
-    clearInterval(logInterval);
-    writeLogsToFile();
-    debugLog("Claude logger exiting gracefully");
+    // JSON Lines logger will handle flushing on exit
+    if (jsonLinesLogger) {
+      jsonLinesLogger.close();
+    }
+    debugLog(`Claude logger exiting gracefully`);
   });
 
   // Handle termination signals
   const handleSignal = (signal) => {
     return () => {
       debugLog(`Capture process received ${signal}, flushing logs and exiting`);
-      clearInterval(logInterval);
-      writeLogsToFile();
+      
+      // JSON Lines logger will handle flushing
+      if (jsonLinesLogger) {
+        jsonLinesLogger.close();
+      }
+      
       process.exit(0);  // Exit with success code
     };
   };
@@ -438,8 +677,10 @@ function setupSignalHandlers() {
   process.on("uncaughtException", (err) => {
     console.error(`FATAL: Uncaught exception: ${err.message}`);
     console.error(err.stack);
-    clearInterval(logInterval);
-    writeLogsToFile();
+    // JSON Lines logger will handle flushing
+    if (jsonLinesLogger) {
+      jsonLinesLogger.close();
+    }
     process.exit(1);  // Exit with error code
   });
 }
@@ -447,10 +688,217 @@ function setupSignalHandlers() {
 // Set up signal handlers
 setupSignalHandlers();
 
+// Set up global error handlers to prevent crashes from network errors
+process.on('uncaughtException', (error) => {
+  // Check if this is a network-related error we can safely ignore
+  const isNetworkError = 
+    error.code === 'ECONNRESET' || 
+    error.code === 'EPIPE' || 
+    error.code === 'ENOTFOUND' ||
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNREFUSED' ||
+    (error.message && (
+      error.message.includes('socket hang up') ||
+      error.message.includes('read ECONNRESET') ||
+      error.message.includes('write EPIPE')
+    ));
+    
+  if (isNetworkError) {
+    console.error('Network error in claude-logger (continuing):', error.message);
+    debugLog(`Network error caught at process level: ${error.code || error.message}`);
+    // Don't crash on network errors - these are expected in networked applications
+  } else {
+    // Log and re-emit non-network errors
+    console.error('Uncaught exception in claude-logger:', error);
+    // Remove our handler and re-emit to let the process handle it
+    process.removeAllListeners('uncaughtException');
+    process.emit('uncaughtException', error);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  // Similar handling for promise rejections
+  const isNetworkError = reason && (
+    reason.code === 'ECONNRESET' || 
+    reason.code === 'EPIPE' || 
+    reason.code === 'ENOTFOUND' ||
+    reason.code === 'ETIMEDOUT' ||
+    reason.code === 'ECONNREFUSED' ||
+    (reason.message && (
+      reason.message.includes('socket hang up') ||
+      reason.message.includes('read ECONNRESET') ||
+      reason.message.includes('write EPIPE')
+    ))
+  );
+  
+  if (isNetworkError) {
+    console.error('Network error in promise (continuing):', reason.message || reason);
+    debugLog('Network error caught in promise rejection');
+  } else {
+    // Log but don't re-throw promise rejections
+    console.error('Unhandled rejection in claude-logger:', reason);
+  }
+});
+
+// Log when module is loaded
+debugLog("Direct capture module loaded");
+debugLog(`Process PID: ${process.pid}`);
+debugLog(`Parent PID: ${process.ppid}`);
+debugLog(`Log file: ${logFile}`);
+debugLog(`Process title: ${process.title}`);
+debugLog(`Exec path: ${process.execPath}`);
+
 // If running directly and not as a module
 if (require.main === module) {
   debugLog("Direct capture module loaded, HTTP/HTTPS interception active");
   console.log(`Claude API Logger v${version} started - capturing requests to anthropic.com`);
+} else {
+  debugLog("Module loaded via require()");
+}
+
+// Patch fetch if it exists
+if (typeof global.fetch === 'function') {
+  debugLog("Patching global.fetch");
+  
+  global.fetch = async function(url, options = {}) {
+    const urlString = typeof url === 'string' ? url : url.toString();
+    
+    debugLog(`Intercepted fetch request to: ${urlString}`);
+    
+    // Check if this is a Claude API request
+    if (urlString.includes('anthropic.com')) {
+      requestCounter++;
+      const requestId = `req-${Date.now()}-${requestCounter}`;
+      debugLog(`Found Claude API fetch request #${requestCounter} (ID: ${requestId}) to: ${urlString}`);
+      
+      const timestamp = new Date().toISOString();
+      
+      // Create log entry
+      const logEntry = {
+        requestId: requestId,
+        request: {
+          timestamp: timestamp,
+          protocol: 'fetch',
+          url: urlString,
+          method: (options.method || 'GET').toUpperCase(),
+          headers: options.headers || {}
+        },
+        response: null,
+        project: {
+          name: projectName,
+          timestamp: timestamp,
+          version: version
+        }
+      };
+      
+      // Redact authorization header
+      if (logEntry.request.headers['authorization']) {
+        logEntry.request.headers['authorization'] = '[REDACTED]';
+      }
+      if (logEntry.request.headers['Authorization']) {
+        logEntry.request.headers['Authorization'] = '[REDACTED]';
+      }
+      
+      // Add body if present
+      if (options.body) {
+        try {
+          logEntry.request.body = typeof options.body === 'string' ? 
+            JSON.parse(options.body) : options.body;
+        } catch (e) {
+          logEntry.request.body = options.body;
+        }
+      }
+      
+      // Don't log yet - wait for response
+      
+      try {
+        // Call original fetch
+        const response = await originalFetch(url, options);
+        
+        // Clone response to read it without consuming
+        const responseClone = response.clone();
+        
+        // Log response
+        const responseData = {
+          timestamp: new Date().toISOString(),
+          statusCode: response.status,
+          headers: {}
+        };
+        
+        // Copy headers
+        response.headers.forEach((value, key) => {
+          responseData.headers[key] = value;
+        });
+        
+        try {
+          const responseBody = await responseClone.text();
+          const contentType = response.headers.get('content-type');
+          
+          if (contentType && contentType.includes('application/json')) {
+            try {
+              const parsedBody = JSON.parse(responseBody);
+              
+              // Redact sensitive information
+              if (parsedBody.user_id) parsedBody.user_id = "[REDACTED]";
+              if (parsedBody.account) {
+                if (parsedBody.account.uuid) parsedBody.account.uuid = "[REDACTED]";
+                if (parsedBody.account.email) parsedBody.account.email = "[EMAIL_REDACTED]";
+                if (parsedBody.account.full_name) parsedBody.account.full_name = "[REDACTED]";
+              }
+              if (parsedBody.organization) {
+                if (parsedBody.organization.uuid) parsedBody.organization.uuid = "[REDACTED]";
+                if (parsedBody.organization.name) parsedBody.organization.name = "[REDACTED]";
+              }
+              
+              responseData.body = parsedBody;
+            } catch (e) {
+              responseData.body = redactSensitiveInfo(responseBody);
+            }
+          } else if (contentType && contentType.includes('text/event-stream')) {
+            // Handle SSE responses
+            responseData.body = responseBody;
+            responseData.streaming = true;
+          } else {
+            responseData.body = redactSensitiveInfo(responseBody);
+          }
+        } catch (e) {
+          responseData.bodyError = 'Error reading response body: ' + e.message;
+        }
+        
+        logEntry.response = responseData;
+        
+        // Log the complete request/response pair
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging fetch request:', err);
+          });
+        }
+        debugLog(`Fetch response complete for request ${requestId}`);
+        
+        return response;
+      } catch (error) {
+        // Log error
+        logEntry.response = {
+          timestamp: new Date().toISOString(),
+          error: error.message
+        };
+        
+        // Log the error response
+        if (jsonLinesLogger) {
+          jsonLinesLogger.log(logEntry).catch(err => {
+            console.error('Error logging fetch error:', err);
+          });
+        }
+        
+        throw error;
+      }
+    }
+    
+    // For non-Claude requests, just pass through
+    return originalFetch(url, options);
+  };
+} else {
+  debugLog("No global.fetch found, skipping fetch patching");
 }
 
 /**
@@ -458,11 +906,10 @@ if (require.main === module) {
  * @module claude-logger/direct-capture
  */
 module.exports = {
-  // Expose the log data structure - can be used by parent module
-  apiLogs,
+  // Expose the JSON Lines logger
+  jsonLinesLogger,
   
   // Core functions
-  writeLogsToFile,
   redactSensitiveInfo,
   
   // Log file paths
