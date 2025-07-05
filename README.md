@@ -87,3 +87,9 @@ This lets you use `claude` as normal, but with all API calls logged.
 Log files are stored in a `logs` directory within your current project. These logs follow the format `project-name_timestamp.json`.
 
 The log files are formatted as a JSON array of request/response objects with metadata about the session.
+
+## Visualize log
+```
+pnpm i
+pnpm dev
+```
