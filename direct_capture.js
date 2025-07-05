@@ -12,6 +12,7 @@ const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
 const JsonLinesLogger = require("./jsonl_logger");
+const anthropic_base_url = process.env.ANTHROPIC_BASE_URL || "anthropic.com";
 
 // Configuration from environment variables
 const logFile = process.env.CLAUDE_API_LOG_FILE;
@@ -83,6 +84,11 @@ const sensitivePatterns = [
 function debugLog(message) {
   if (debugMode) {
     console.error(`DEBUG: ${message}`);
+    if (jsonLinesLogger) {
+      jsonLinesLogger.log({
+        debug: message
+      });
+    }
   }
 }
 
@@ -193,7 +199,7 @@ function logRequest(protocol, options, req, url) {
   debugLog(`Intercepted ${protocol} request to: ${url}`);
   
   // Skip non-Claude API requests
-  if (!url.includes("anthropic.com")) {
+  if (!url.includes("anthropic.com") && !url.includes(anthropic_base_url)) {
     debugLog(`Skipping non-Claude request: ${url}`);
     return;
   }
@@ -766,7 +772,7 @@ if (typeof global.fetch === 'function') {
     debugLog(`Intercepted fetch request to: ${urlString}`);
     
     // Check if this is a Claude API request
-    if (urlString.includes('anthropic.com')) {
+    if (urlString.includes('anthropic.com') || urlString.includes(anthropic_base_url)) {
       requestCounter++;
       const requestId = `req-${Date.now()}-${requestCounter}`;
       debugLog(`Found Claude API fetch request #${requestCounter} (ID: ${requestId}) to: ${urlString}`);
