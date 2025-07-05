@@ -32,6 +32,8 @@ const LogFileViewer = () => {
     let cachedInputTokens = null
     let cacheCreationInputTokens = null
     let assistantMessage = ''
+    let toolCalls = []
+    let currentToolCall = null
     
     if (typeof responseBody === 'string' && responseBody.includes('message_start')) {
       const lines = responseBody.split('\n')
@@ -56,6 +58,31 @@ const LogFileViewer = () => {
             // Extract message content from text deltas
             else if (data.type === 'content_block_delta' && data.delta?.text) {
               assistantMessage += data.delta.text
+            }
+            
+            // Handle tool use content blocks
+            else if (data.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
+              currentToolCall = {
+                id: data.content_block.id,
+                name: data.content_block.name,
+                input: ''
+              }
+            }
+            
+            // Handle tool use partial JSON
+            else if (data.type === 'content_block_delta' && data.delta?.partial_json && currentToolCall) {
+              currentToolCall.input += data.delta.partial_json
+            }
+            
+            // Complete tool call
+            else if (data.type === 'content_block_stop' && currentToolCall) {
+              try {
+                currentToolCall.input = JSON.parse(currentToolCall.input)
+              } catch (e) {
+                // Keep as string if parsing fails
+              }
+              toolCalls.push(currentToolCall)
+              currentToolCall = null
             }
             
             // Update output tokens from message_delta
@@ -110,6 +137,11 @@ const LogFileViewer = () => {
         contentParts = msg.content.map(part => ({
           type: part.type || 'text',
           text: part.text || '',
+          tool_use_id: part.tool_use_id || '',
+          name: part.name || '',
+          input: part.input || '',
+          content: part.content || '',
+          is_error: part.is_error || false,
           isCached: !!(part.cache_control && part.cache_control.type === 'ephemeral')
         }))
       }
@@ -137,6 +169,7 @@ const LogFileViewer = () => {
       tools: tools,
       lastUserMessage,
       assistantMessage,
+      toolCalls,
       inputTokens,
       outputTokens,
       cachedInputTokens,
@@ -613,20 +646,106 @@ const LogFileViewer = () => {
                 <div key={partIndex} className="border border-gray-200 rounded">
                   <div className="bg-gray-100 px-3 py-2 border-b border-gray-200 flex items-center justify-between">
                     <span className="text-sm font-medium text-gray-700">
-                      {part.type === 'text' ? '📝 Text Content' : `📎 ${part.type}`}
+                      {part.type === 'text' ? '📝 Text Content' : 
+                       part.type === 'tool_use' ? '🔧 Tool Use' : 
+                       part.type === 'tool_result' ? '📊 Tool Result' : 
+                       `📎 ${part.type}`}
                     </span>
-                    {part.isCached && (
-                      <div className="flex items-center gap-1">
-                        <span className="text-green-600 text-sm">⚡</span>
-                        <span className="text-green-600 text-xs font-medium bg-green-100 px-2 py-1 rounded">CACHED</span>
+                    <div className="flex items-center gap-2">
+                      {part.type === 'tool_use' && part.name && (
+                        <span className="text-blue-600 text-xs bg-blue-100 px-2 py-1 rounded">
+                          {part.name}
+                        </span>
+                      )}
+                      {part.type === 'tool_result' && part.tool_use_id && (
+                        <span className="text-gray-600 text-xs bg-gray-100 px-2 py-1 rounded">
+                          ID: {part.tool_use_id}
+                        </span>
+                      )}
+                      {part.type === 'tool_result' && part.is_error && (
+                        <span className="text-red-600 text-xs bg-red-100 px-2 py-1 rounded">
+                          ERROR
+                        </span>
+                      )}
+                      {part.isCached && (
+                        <div className="flex items-center gap-1">
+                          <span className="text-green-600 text-sm">⚡</span>
+                          <span className="text-green-600 text-xs font-medium bg-green-100 px-2 py-1 rounded">CACHED</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="bg-white p-3">
+                    {part.type === 'text' && (
+                      <pre className="font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                        {part.text || 'N/A'}
+                      </pre>
+                    )}
+                    {part.type === 'tool_use' && (
+                      <div className="space-y-3">
+                        <div>
+                          <h6 className="text-sm font-medium text-gray-700 mb-1">Tool Name:</h6>
+                          <span className="text-blue-600 font-medium">{part.name || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <h6 className="text-sm font-medium text-gray-700 mb-1">Input:</h6>
+                          <pre className="bg-gray-50 border border-gray-200 rounded p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                            {typeof part.input === 'object' ? JSON.stringify(part.input, null, 2) : part.input || 'N/A'}
+                          </pre>
+                        </div>
+                      </div>
+                    )}
+                    {part.type === 'tool_result' && (
+                      <div className="space-y-3">
+                        <div>
+                          <h6 className="text-sm font-medium text-gray-700 mb-1">Tool Use ID:</h6>
+                          <span className="text-gray-600 font-mono text-sm">{part.tool_use_id || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <h6 className="text-sm font-medium text-gray-700 mb-1">Result:</h6>
+                          <pre className={`border border-gray-200 rounded p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto ${
+                            part.is_error ? 'bg-red-50 border-red-200' : 'bg-gray-50'
+                          }`}>
+                            {part.content || 'N/A'}
+                          </pre>
+                        </div>
                       </div>
                     )}
                   </div>
-                  <pre className="bg-white p-3 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
-                    {part.text || 'N/A'}
-                  </pre>
                 </div>
               ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  // Component for displaying tool calls made by the assistant
+  const ToolCallsDisplay = ({ toolCalls }) => {
+    if (!toolCalls || toolCalls.length === 0) {
+      return <div className="text-gray-500 italic">No tool calls</div>
+    }
+
+    return (
+      <div className="space-y-3">
+        {toolCalls.map((toolCall, index) => (
+          <div key={index} className="border border-gray-200 rounded-lg p-4 bg-gray-50">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-lg">🔧</span>
+              <h5 className="font-semibold text-gray-800">{toolCall.name}</h5>
+              <span className="text-xs text-gray-500 bg-gray-200 px-2 py-1 rounded">
+                {toolCall.id}
+              </span>
+            </div>
+            
+            <div className="mt-2">
+              <h6 className="text-sm font-medium text-gray-700 mb-2">Input:</h6>
+              <pre className="bg-white border border-gray-200 rounded p-3 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                {typeof toolCall.input === 'object' 
+                  ? JSON.stringify(toolCall.input, null, 2) 
+                  : toolCall.input || 'N/A'}
+              </pre>
             </div>
           </div>
         ))}
@@ -838,9 +957,28 @@ const LogFileViewer = () => {
 
                       <div>
                         <h4 className="text-base font-semibold text-gray-800 mb-3 border-l-4 border-green-500 pl-3">Assistant Response</h4>
-                        <pre className="bg-gray-50 border border-gray-200 rounded-md p-4 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
-                          {item.assistantMessage || 'N/A'}
-                        </pre>
+                        
+                        {/* Tool Calls */}
+                        {item.toolCalls && item.toolCalls.length > 0 && (
+                          <div className="mb-4">
+                            <h5 className="text-sm font-medium text-gray-700 mb-2">Tool Calls ({item.toolCalls.length}):</h5>
+                            <ToolCallsDisplay toolCalls={item.toolCalls} />
+                          </div>
+                        )}
+                        
+                        {/* Text Response */}
+                        {item.assistantMessage && (
+                          <div>
+                            <h5 className="text-sm font-medium text-gray-700 mb-2">Text Response:</h5>
+                            <pre className="bg-gray-50 border border-gray-200 rounded-md p-4 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                              {item.assistantMessage}
+                            </pre>
+                          </div>
+                        )}
+                        
+                        {!item.assistantMessage && (!item.toolCalls || item.toolCalls.length === 0) && (
+                          <div className="text-gray-500 italic">No response content</div>
+                        )}
                       </div>
 
                       {/* Tools - Fourth */}
