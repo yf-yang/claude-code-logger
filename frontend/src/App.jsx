@@ -439,7 +439,7 @@ const LogFileViewer = () => {
                     📝 Description
                   </h6>
                 </div>
-                <p className="text-gray-700 text-sm leading-relaxed">
+                <p className="text-gray-700 text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
                   {tool.description}
                 </p>
               </div>
