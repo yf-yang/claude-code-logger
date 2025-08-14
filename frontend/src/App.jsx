@@ -708,7 +708,7 @@ const LogFileViewer = () => {
                           <pre className={`border border-gray-200 rounded p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto ${
                             part.is_error ? 'bg-red-50 border-red-200' : 'bg-gray-50'
                           }`}>
-                            {part.content || 'N/A'}
+                            {typeof part.content === 'object' ? JSON.stringify(part.content, null, 2) : part.content || 'N/A'}
                           </pre>
                         </div>
                       </div>
