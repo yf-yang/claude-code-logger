@@ -1,5 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react'
 
+const anthropic_base_url = import.meta.env.ANTHROPIC_BASE_URL || "anthropic.com";
+
 const LogFileViewer = () => {
   const [logData, setLogData] = useState([])
   const [expandedItems, setExpandedItems] = useState(new Set())
@@ -18,8 +20,8 @@ const LogFileViewer = () => {
     const request = logEntry.request || {}
     const response = logEntry.response || {}
     
-    // Check if this is an API request to anyrouter.top (Claude API)
-    if (!request.url?.includes('anyrouter.top')) {
+    // Check if this is an API request to anthropic_base_url (Claude API)
+    if (!request.url?.includes(anthropic_base_url)) {
       return null
     }
 
